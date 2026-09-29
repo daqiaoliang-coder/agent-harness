@@ -1,0 +1,17 @@
+{
+  // 架构参考: 原版为内部 TS 工程; 这里最小化为 CommonJS 输出(Node 20 无法直接跑 TS)
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts"]
+}

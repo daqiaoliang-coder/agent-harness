@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-harness</title>
+<style>
+  :root {
+    --bg: #0f1117; --bg2: #161923; --bg3: #1d2130;
+    --border: #2a2f42; --text: #d7dae6; --dim: #7c8299;
+    --accent: #d97757; --accent2: #8b5cf6;
+    --ok: #3fb950; --err: #f85149; --warn: #d29922;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    display: flex; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  /* ── 侧栏 ── */
+  #sidebar {
+    width: 230px; flex-shrink: 0; background: var(--bg2); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 12px;
+  }
+  #logo { font-family: var(--mono); font-weight: 700; font-size: 15px; padding: 4px 6px 14px; color: var(--accent); }
+  #logo small { color: var(--dim); font-weight: 400; font-size: 11px; display: block; }
+  #new-session {
+    background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px;
+    font-size: 13px; cursor: pointer; margin-bottom: 12px;
+  }
+  #new-session:hover { filter: brightness(1.1); }
+  #sessions { flex: 1; overflow-y: auto; }
+  #sessions h3 { font-size: 11px; color: var(--dim); text-transform: uppercase; padding: 6px; letter-spacing: .05em; }
+  .sess {
+    padding: 7px 9px; border-radius: 7px; cursor: pointer; font-size: 12px;
+    font-family: var(--mono); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .sess:hover { background: var(--bg3); color: var(--text); }
+  .sess.active { background: var(--bg3); color: var(--accent); }
+  /* ── 主区 ── */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #topbar {
+    display: flex; align-items: center; gap: 10px; padding: 10px 18px;
+    border-bottom: 1px solid var(--border); background: var(--bg2); font-size: 12px; color: var(--dim);
+  }
+  .badge {
+    font-family: var(--mono); background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 20px; padding: 2px 10px; font-size: 11px;
+  }
+  .badge b { color: var(--text); font-weight: 600; }
+  #conn { margin-left: auto; }
+  #conn.on { color: var(--ok); } #conn.off { color: var(--err); }
+  #stream { flex: 1; overflow-y: auto; padding: 20px 18px 8px; scroll-behavior: smooth; }
+  #stream-inner { max-width: 860px; margin: 0 auto; }
+  /* 消息 */
+  .msg { margin-bottom: 14px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user {
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 12px 12px 3px 12px;
+    padding: 9px 13px; margin-left: 60px; color: #e8eaf2;
+  }
+  .msg.assistant { padding: 2px 4px; }
+  .msg.assistant::before { content: "✳"; color: var(--accent); font-size: 12px; margin-right: 8px; }
+  .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent); vertical-align: -2px; animation: blink 1s step-start infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  /* 工具卡片 */
+  .tool {
+    border: 1px solid var(--border); border-radius: 10px; margin: 8px 0 14px; overflow: hidden;
+    background: var(--bg2); font-family: var(--mono); font-size: 12px;
+  }
+  .tool-head {
+    display: flex; align-items: center; gap: 8px; padding: 7px 11px; cursor: pointer; user-select: none;
+  }
+  .tool-head:hover { background: var(--bg3); }
+  .tool-name { color: var(--accent2); font-weight: 600; }
+  .tool-sum { color: var(--dim); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tool-badge { font-size: 10px; border-radius: 10px; padding: 1px 8px; border: 1px solid var(--border); color: var(--dim); }
+  .tool-badge.run { color: var(--warn); border-color: var(--warn); }
+  .tool-badge.ok { color: var(--ok); border-color: var(--ok); }
+  .tool-badge.err { color: var(--err); border-color: var(--err); }
+  .tool-perm { font-size: 10px; color: var(--dim); }
+  .tool-body { display: none; border-top: 1px solid var(--border); }
+  .tool.open .tool-body { display: block; }
+  .tool-body .lbl { color: var(--dim); padding: 6px 11px 2px; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+  .tool-body pre {
+    padding: 2px 11px 9px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; color: var(--text);
+  }
+  .tool-body pre.out { color: #a8b0c5; max-height: 300px; overflow-y: auto; }
+  /* 系统行(压缩/日志/错误) */
+  .sysline { font-family: var(--mono); font-size: 11px; color: var(--dim); margin: 3px 0; }
+  .sysline.compact { color: var(--warn); }
+  .sysline.error { color: var(--err); }
+  .sysline.log { display: none; }
+  body.show-log .sysline.log { display: block; }
+  /* 权限弹窗 */
+  #perm-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none;
+    align-items: center; justify-content: center; z-index: 50;
+  }
+  #perm-overlay.show { display: flex; }
+  #perm-card {
+    width: min(520px, 92vw); background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 14px; padding: 20px; box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  }
+  #perm-card h2 { font-size: 15px; margin-bottom: 10px; color: var(--warn); }
+  #perm-tool { font-family: var(--mono); color: var(--accent2); margin-bottom: 6px; }
+  #perm-why { color: var(--dim); font-size: 13px; margin-bottom: 12px; }
+  #perm-input {
+    font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; max-height: 180px; overflow: auto; margin-bottom: 16px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #perm-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  #perm-actions button { padding: 8px 18px; border-radius: 8px; border: 0; cursor: pointer; font-size: 13px; }
+  #perm-yes { background: var(--ok); color: #fff; }
+  #perm-no { background: var(--bg3); color: var(--text); border: 1px solid var(--border) !important; }
+  /* 输入区 */
+  #inputbar { padding: 12px 18px 16px; background: var(--bg); }
+  #inputwrap {
+    max-width: 860px; margin: 0 auto; background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 14px; padding: 10px 14px; display: flex; align-items: flex-end; gap: 10px;
+  }
+  #inputwrap:focus-within { border-color: var(--accent); }
+  #input {
+    flex: 1; background: none; border: 0; outline: 0; resize: none; color: var(--text);
+    font: inherit; max-height: 180px; line-height: 1.5;
+  }
+  #send {
+    background: var(--accent); border: 0; color: #fff; border-radius: 9px;
+    width: 34px; height: 34px; cursor: pointer; font-size: 15px; flex-shrink: 0;
+  }
+  #send:disabled { opacity: .4; cursor: default; }
+  #inputbar label {
+    display: flex; align-items: center; gap: 5px; max-width: 860px; margin: 6px auto 0;
+    font-size: 11px; color: var(--dim); font-family: var(--mono); cursor: pointer; user-select: none;
+  }
+</style>
+</head>
+<body>
+  <nav id="sidebar">
+    <div id="logo">agent-harness<small>harness web</small></div>
+    <button id="new-session">＋ 新会话</button>
+    <div id="sessions"><h3>会话</h3><div id="sess-list"></div></div>
+  </nav>
+  <main id="main">
+    <div id="topbar">
+      <span class="badge">model <b id="m-model">–</b></span>
+      <span class="badge">perm <b id="m-mode">–</b></span>
+      <span class="badge">session <b id="m-sess">–</b></span>
+      <span id="conn" class="off">● connecting</span>
+    </div>
+    <div id="stream"><div id="stream-inner"></div></div>
+    <div id="inputbar">
+      <div id="inputwrap">
+        <textarea id="input" rows="1" placeholder="发送消息… (Enter 发送 / Shift+Enter 换行)"></textarea>
+        <button id="send" title="发送">➤</button>
+      </div>
+      <label><input type="checkbox" id="show-log"> 显示引擎日志(水位/cache/usage)</label>
+    </div>
+  </main>
+
+  <div id="perm-overlay">
+    <div id="perm-card">
+      <h2>⚠ 权限确认</h2>
+      <div id="perm-tool"></div>
+      <div id="perm-why"></div>
+      <div id="perm-input"></div>
+      <div id="perm-actions">
+        <button id="perm-no">拒绝 (Esc)</button>
+        <button id="perm-yes">允许执行</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+// ── DOM 基础 ──
+const $ = (id) => document.getElementById(id);
+const streamInner = $("stream-inner"), streamEl = $("stream");
+const toolCards = new Map();       // toolUseId → card 元素
+let streamBubble = null;           // 当前流式助手气泡(stop/新消息时关闭)
+let activeSess = "";
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+function nearBottom() {
+  return streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight < 120;
+}
+function scrollBottom(force) {
+  if (force || nearBottom()) streamEl.scrollTop = streamEl.scrollHeight;
+}
+
+// ── 渲染: 消息 ──
+function addUser(text) {
+  closeStream();
+  streamInner.appendChild(el("div", "msg user", text));
+  scrollBottom();
+}
+function ensureStream() {
+  if (!streamBubble) {
+    streamBubble = el("div", "msg assistant");
+    streamBubble.appendChild(el("span", "cursor"));
+    streamInner.appendChild(streamBubble);
+  }
+  return streamBubble;
+}
+function closeStream() {
+  if (streamBubble) {
+    streamBubble.querySelector(".cursor")?.remove();
+    streamBubble = null;
+  }
+}
+function assistantDelta(text) {
+  const b = ensureStream();
+  b.insertBefore(document.createTextNode(text), b.querySelector(".cursor"));
+  scrollBottom();
+}
+function assistantMessage(text) {
+  if (streamBubble) { closeStream(); } // 流式已渐进渲染 → 忽略整段重复
+  else {
+    const b = el("div", "msg assistant", text);
+    streamInner.appendChild(b);
+  }
+  scrollBottom();
+}
+
+// ── 渲染: 工具卡片 ──
+function inputSummary(name, input) {
+  if (name === "Bash" && input.command) return String(input.command);
+  for (const k of ["path", "file_path", "pattern", "query", "prompt"]) {
+    if (input[k]) return `${k}: ${input[k]}`;
+  }
+  return JSON.stringify(input).slice(0, 120);
+}
+function toolStart(ev) {
+  closeStream();
+  const card = el("div", "tool");
+  const head = el("div", "tool-head");
+  head.appendChild(el("span", "tool-name", "⚙ " + ev.name));
+  head.appendChild(el("span", "tool-sum", inputSummary(ev.name, ev.input)));
+  const badge = el("span", "tool-badge run", "running");
+  head.appendChild(badge);
+  card.appendChild(head);
+  const body = el("div", "tool-body");
+  body.appendChild(el("div", "lbl", "input"));
+  body.appendChild(el("pre", "in", JSON.stringify(ev.input, null, 2)));
+  const outLbl = el("div", "lbl", "output"); const outPre = el("pre", "out", "");
+  body.appendChild(outLbl); body.appendChild(outPre);
+  card.appendChild(body);
+  head.onclick = () => card.classList.toggle("open");
+  streamInner.appendChild(card);
+  toolCards.set(ev.id, { card, badge, outPre, perm: null });
+  scrollBottom();
+}
+function toolResult(ev) {
+  const t = toolCards.get(ev.id);
+  if (!t) return;
+  t.outPre.textContent = ev.output || "(空)";
+  t.badge.textContent = ev.isError ? "error" : "done";
+  t.badge.className = "tool-badge " + (ev.isError ? "err" : "ok");
+  if (ev.isError) t.card.classList.add("open"); // 出错自动展开
+  scrollBottom();
+}
+function permDecision(ev) {
+  const t = toolCards.get(ev.id);
+  if (!t) return;
+  if (t.perm) t.perm.remove();
+  t.perm = el("span", "tool-perm", `${ev.decision}·${ev.source}`);
+  t.card.querySelector(".tool-head").appendChild(t.perm);
+}
+
+// ── 渲染: 系统行 ──
+function sysLine(cls, text) {
+  streamInner.appendChild(el("div", "sysline " + cls, text));
+  scrollBottom();
+}
+
+// ── 权限弹窗(队列: 同刻可能有多个挂起请求, 逐个展示) ──
+const permQueue = [];
+let permShowing = null;
+function showPerm(req) {
+  permQueue.push(req);
+  if (!permShowing) nextPerm();
+}
+function nextPerm() {
+  permShowing = permQueue.shift() ?? null;
+  if (!permShowing) { $("perm-overlay").classList.remove("show"); return; }
+  $("perm-tool").textContent = `工具: ${permShowing.toolName}`;
+  $("perm-why").textContent = `原因: ${permShowing.reason}`;
+  $("perm-input").textContent = JSON.stringify(permShowing.input, null, 2);
+  $("perm-overlay").classList.add("show");
+}
+async function answerPerm(answer) {
+  const cur = permShowing;
+  if (!cur) return;
+  nextPerm();
+  try {
+    await fetch(`/api/permission/${encodeURIComponent(cur.id)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    });
+  } catch { /* 连接断开: 事件流重连后状态自愈 */ }
+}
+$("perm-yes").onclick = () => answerPerm("yes");
+$("perm-no").onclick = () => answerPerm("no");
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && permShowing) answerPerm("no");
+});
+
+// ── 会话列表 ──
+async function refreshSessions() {
+  try {
+    const r = await fetch("/api/sessions");
+    const d = await r.json();
+    const list = $("sess-list");
+    list.textContent = "";
+    for (const s of d.sessions.slice(0, 30)) {
+      const n = el("div", "sess" + (s.id === activeSess ? " active" : ""),
+        s.id.replace(/^sess_/, "") + " · " + new Date(s.mtime).toLocaleString());
+      n.onclick = async () => {
+        if (s.id === activeSess) return;
+        await fetch("/api/session/resume", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: s.id }),
+        });
+      };
+      list.appendChild(n);
+    }
+  } catch { /* 服务未就绪时静默 */ }
+}
+$("new-session").onclick = async () => {
+  await fetch("/api/session/new", { method: "POST" });
+};
+
+// ── 事件分发 ──
+function handleEvent(ev) {
+  switch (ev.kind) {
+    case "ready":
+      $("m-model").textContent = ev.model;
+      $("m-mode").textContent = ev.mode;
+      $("m-sess").textContent = ev.sessionId.replace(/^sess_/, "");
+      activeSess = ev.sessionId;
+      refreshSessions();
+      break;
+    case "history":
+      streamInner.textContent = "";
+      toolCards.clear();
+      closeStream();
+      ev.events.forEach(handleEvent); // 复用同一套词汇重放
+      scrollBottom(true);
+      break;
+    case "user_message": addUser(ev.text); break;
+    case "assistant_delta": assistantDelta(ev.text); break;
+    case "assistant_message": assistantMessage(ev.text); break;
+    case "tool_start": toolStart(ev); break;
+    case "tool_result": toolResult(ev); break;
+    case "perm": permDecision(ev); break;
+    case "compact": sysLine("compact", `⇣ [${ev.level}] ${ev.detail}`); break;
+    case "log": sysLine("log", ev.text); break;
+    case "error": sysLine("error", `✖ ${ev.text}`); break;
+    case "stop": closeStream(); refreshSessions(); break;
+    case "permission_request": showPerm(ev); break;
+    case "permission_resolved":
+      if (permShowing && permShowing.id === ev.id) nextPerm();
+      break;
+  }
+}
+
+// ── SSE 连接 ──
+function connect() {
+  const es = new EventSource("/api/events");
+  es.onopen = () => { $("conn").textContent = "● connected"; $("conn").className = "on"; };
+  es.onerror = () => { $("conn").textContent = "● reconnecting"; $("conn").className = "off"; };
+  es.onmessage = (m) => {
+    try { handleEvent(JSON.parse(m.data)); } catch { /* 忽略坏帧 */ }
+  };
+}
+connect();
+
+// ── 输入区 ──
+const input = $("input"), sendBtn = $("send");
+function autosize() {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 180) + "px";
+}
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = ""; autosize();
+  try {
+    const r = await fetch("/api/message", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) { const d = await r.json(); sysLine("error", `✖ ${d.error || r.status}`); }
+  } catch (e) { sysLine("error", `✖ 发送失败: ${e.message}`); }
+}
+sendBtn.onclick = send;
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+input.addEventListener("input", autosize);
+$("show-log").onchange = (e) => document.body.classList.toggle("show-log", e.target.checked);
+</script>
+</body>
+</html>

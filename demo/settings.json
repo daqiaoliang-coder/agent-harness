@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(echo:*)",
+      "Bash(seq:*)",
+      "Bash(cat:*)",
+      "mcp__echo__echo"
+    ],
+    "deny": [
+      "Bash(rm -rf:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash demo/hooks/prevent-rm.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "echo": {
+      "command": "node",
+      "args": ["test/mcp-server.js"]
+    }
+  }
+}

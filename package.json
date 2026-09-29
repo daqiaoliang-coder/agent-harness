@@ -1,0 +1,19 @@
+{
+  "name": "agent-harness",
+  "version": "0.1.0",
+  "description": "AI coding agent harness — 参考架构实现的最小骨架",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "tsc",
+    "demo": "tsc && node dist/cli.js demo",
+    "chat": "tsc && node dist/cli.js chat",
+    "web": "tsc && node dist/cli.js web",
+    "smoke": "tsc && node test/smoke.js",
+    "smoke:web": "tsc && node test/web-smoke.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "5.6"
+  }
+}

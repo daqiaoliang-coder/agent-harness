@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.claude-like/
+.agent-harness/
+*.log
+.DS_Store
