@@ -38,6 +38,7 @@ import {
 } from "../cli";
 import { PRODUCTION_COMPACT_CONFIG, computeWatermarks } from "../compact/watermarks";
 import { MergedSettings, composeSystemPrompt, resolveModel } from "../settings/loader";
+import { loadProjectMemory } from "../settings/memory";
 
 const PORT = Number(process.env.PORT ?? 3218);
 // 默认只绑定回环地址: 未鉴权的局域网暴露 = 任何人可发消息/替答权限弹窗(= 远程授权任意 Bash)
@@ -243,8 +244,10 @@ async function activateSession(opts: { resumeId?: string } = {}): Promise<string
     broadcastReady(live);
     return lastActiveId;
   }
-  // settings 每次新会话重读 → 分层合并的变更即时生效(热加载仅覆盖规则/Hook, 见 createSession)
+  // settings 每次新会话重读 → 分层合并的变更即时生效(热加载仅覆盖规则/Hook, 见 createSession);
+  // CLAUDE.md 项目记忆同语义: 每会话重读一次(resume 亦重读), 改动下一会话生效, 不加 watcher
   const merged = loadSettings();
+  const memory = loadProjectMemory({ projectRoot: PROJECT_ROOT });
   const { rules, hookSettings, mcpServers, engine } = merged;
   const p = makeProvider(merged);
   const sessionId = opts.resumeId ?? `sess_web_${Date.now()}_${++webSessSeq}`;
@@ -252,8 +255,8 @@ async function activateSession(opts: { resumeId?: string } = {}): Promise<string
   const session = await createSession({
     provider: p.provider,
     cfg: PRODUCTION_COMPACT_CONFIG,
-    // 内置基线 + settings 各层追加段(append-only; 真实模型下注入领域上下文)
-    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged),
+    // 内置基线 + settings 各层追加段 + CLAUDE.md 项目记忆(append-only; 真实模型下注入领域上下文)
+    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged, { memory: memory.text }),
     rules,
     hookSettings,
     mcpServers,

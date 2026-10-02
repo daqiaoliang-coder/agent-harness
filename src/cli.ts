@@ -44,6 +44,7 @@ import {
   resolveModel,
   resolveLayerPaths,
 } from "./settings/loader";
+import { loadProjectMemory } from "./settings/memory";
 
 const PROJECT_ROOT = process.cwd();
 const ARTIFACTS_DIR = path.join(PROJECT_ROOT, ".agent-harness", "artifacts");
@@ -355,6 +356,8 @@ function buildScript(): ScriptedTurn[] {
 
 async function runDemo(): Promise<void> {
   const merged = loadSettings();
+  // CLAUDE.md 项目记忆: 每入口读一次(与 settings 同语义); 命中时 log 一行
+  const memory = loadProjectMemory({ projectRoot: PROJECT_ROOT, log });
   const { rules, hookSettings, mcpServers, engine } = merged;
   const cfg = DEMO_COMPACT_CONFIG;
   const wm = computeWatermarks(cfg);
@@ -372,8 +375,8 @@ async function runDemo(): Promise<void> {
   const session = await createSession({
     provider,
     cfg,
-    // 内置 demo 基线 + settings 各层追加段(append-only; Mock 忽略内容, 计量含追加 token)
-    systemPrompt: composeSystemPrompt(DEMO_SYSTEM_PROMPT, merged),
+    // 内置 demo 基线 + settings 各层追加段 + CLAUDE.md 项目记忆(append-only; Mock 忽略内容, 计量含追加 token)
+    systemPrompt: composeSystemPrompt(DEMO_SYSTEM_PROMPT, merged, { memory: memory.text }),
     rules,
     hookSettings,
     mcpServers,
@@ -465,6 +468,7 @@ async function runChat(): Promise<void> {
 
   // model 解析序: env ANTHROPIC_MODEL > settings 分层合并(本地>项目>用户) > 内置默认
   const merged = loadSettings();
+  const memory = loadProjectMemory({ projectRoot: PROJECT_ROOT, log });
   const { rules, hookSettings, mcpServers, engine } = merged;
   const model = resolveModel(merged);
   const provider = new AnthropicProvider({ apiKey: resolved.apiKey, model, log });
@@ -486,9 +490,9 @@ async function runChat(): Promise<void> {
   const session = await createSession({
     provider,
     cfg,
-    // 系统提示组装(前缀): 内置基线 → settings 追加段(user→project→local) → --append-system-prompt;
+    // 系统提示组装(前缀): 内置基线 → settings 追加段(user→project→local) → CLAUDE.md 项目记忆 → --append-system-prompt;
     // plan 模式后缀由 createSession 按 mode 内部追加 → setMode 运行中动态增删(单一事实来源 = 当前模式)
-    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged, { cliAppend }),
+    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged, { cliAppend, memory: memory.text }),
     rules,
     hookSettings,
     mcpServers,
@@ -691,6 +695,8 @@ async function runHeadless(args: string[]): Promise<void> {
   const flags = parseChatFlags(args, errLog);
   const mode: PermissionMode = permissionMode ?? (flags.planMode ? "plan" : "auto");
   const merged = loadSettings();
+  // 日志走 stderr(headless stdout 须纯净可管道)
+  const memory = loadProjectMemory({ projectRoot: PROJECT_ROOT, log: errLog });
   const { rules, hookSettings, mcpServers, engine } = merged;
   let provider: LLMProvider;
   let model: string;
@@ -719,7 +725,7 @@ async function runHeadless(args: string[]): Promise<void> {
   const session = await createSession({
     provider,
     cfg: PRODUCTION_COMPACT_CONFIG,
-    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged, { cliAppend: flags.cliAppend }),
+    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged, { cliAppend: flags.cliAppend, memory: memory.text }),
     rules,
     hookSettings,
     mcpServers,

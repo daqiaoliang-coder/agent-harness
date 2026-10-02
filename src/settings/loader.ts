@@ -56,14 +56,21 @@ export function resolveModel(merged: Pick<MergedSettings, "model">): string {
   return process.env.ANTHROPIC_MODEL ?? merged.model ?? "claude-sonnet-4-5";
 }
 
-// 系统提示组装: 内置基线 → settings 追加段(user → project → local) → CLI 追加 → 模式后缀。
+// 系统提示组装: 内置基线 → settings 追加段(user → project → local) → CLAUDE.md 项目记忆 → CLI 追加 → 模式后缀。
+// memory 段由 loadProjectMemory 提供(src/settings/memory.ts, 双层 CLAUDE.md/AGENTS.md 查找);
 // 模式后缀(Plan 等)由引擎注入, 永远最后且不可被配置覆盖。
 export function composeSystemPrompt(
   base: string,
   merged: Pick<MergedSettings, "systemPromptAppend">,
-  extra?: { cliAppend?: string; modeSuffix?: string }
+  extra?: { cliAppend?: string; memory?: string; modeSuffix?: string }
 ): string {
-  return [base, merged.systemPromptAppend || undefined, extra?.cliAppend || undefined, extra?.modeSuffix || undefined]
+  return [
+    base,
+    merged.systemPromptAppend || undefined,
+    extra?.memory || undefined,
+    extra?.cliAppend || undefined,
+    extra?.modeSuffix || undefined,
+  ]
     .filter((s): s is string => !!s)
     .join("\n\n");
 }

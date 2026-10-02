@@ -2286,6 +2286,134 @@ exit 1
     assert.ok(!evs2.some((e) => e.kind === "todos"), "无清单 → 不追加事件");
   });
 
+  // ---------- Part 17: CLAUDE.md 项目记忆(双层查找 + 级联 + 截断 + 段序) ----------
+  console.log("[17] CLAUDE.md 项目记忆: 双层查找/AGENTS.md fallback/级联序/64K 截断/静默缺失 + composeSystemPrompt 段序");
+  const { loadProjectMemory } = require("../dist/settings/memory");
+
+  await test("loadProjectMemory: 仅项目级 CLAUDE.md 命中 + log 一行 + sources 诊断", async () => {
+    const u17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-u-"));
+    const p17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-p-"));
+    try {
+      fs.writeFileSync(path.join(p17, "CLAUDE.md"), "项目级记忆");
+      const lines = [];
+      const mem = loadProjectMemory({ userDir: u17, projectRoot: p17, log: (l) => lines.push(l) });
+      assert.strictEqual(mem.text, "项目级记忆");
+      assert.strictEqual(mem.sources.length, 1);
+      assert.strictEqual(mem.sources[0].path, path.join(p17, "CLAUDE.md"));
+      assert.strictEqual(mem.sources[0].chars, 5);
+      assert.strictEqual(mem.sources[0].truncated, false);
+      assert.ok(lines.some((l) => l === `[memory] ${path.join(p17, "CLAUDE.md")}(5 chars)`), lines.join("\n"));
+    } finally {
+      fs.rmSync(u17, { recursive: true, force: true });
+      fs.rmSync(p17, { recursive: true, force: true });
+    }
+  });
+
+  await test("loadProjectMemory: 项目级 CLAUDE.md 缺失 → 同级 AGENTS.md fallback;两者并存 CLAUDE.md 优先", async () => {
+    const u17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-u-"));
+    const p17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-p-"));
+    try {
+      fs.writeFileSync(path.join(p17, "AGENTS.md"), "agents 内容");
+      let mem = loadProjectMemory({ userDir: u17, projectRoot: p17, log: () => {} });
+      assert.strictEqual(mem.text, "agents 内容");
+      assert.deepStrictEqual(mem.sources.map((s) => path.basename(s.path)), ["AGENTS.md"], "fallback 命中");
+      fs.writeFileSync(path.join(p17, "CLAUDE.md"), "claude 内容");
+      mem = loadProjectMemory({ userDir: u17, projectRoot: p17, log: () => {} });
+      assert.strictEqual(mem.text, "claude 内容");
+      assert.deepStrictEqual(mem.sources.map((s) => path.basename(s.path)), ["CLAUDE.md"], "同级首个命中: AGENTS.md 不再读");
+    } finally {
+      fs.rmSync(u17, { recursive: true, force: true });
+      fs.rmSync(p17, { recursive: true, force: true });
+    }
+  });
+
+  await test("loadProjectMemory: 用户级+项目级级联拼接(用户级在前, 查找序即拼接序)", async () => {
+    const u17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-u-"));
+    const p17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-p-"));
+    try {
+      fs.writeFileSync(path.join(u17, "CLAUDE.md"), "用户级记忆");
+      fs.writeFileSync(path.join(p17, "CLAUDE.md"), "项目级记忆");
+      const mem = loadProjectMemory({ userDir: u17, projectRoot: p17, log: () => {} });
+      assert.strictEqual(mem.text, "用户级记忆\n\n项目级记忆");
+      assert.deepStrictEqual(mem.sources.map((s) => s.path), [path.join(u17, "CLAUDE.md"), path.join(p17, "CLAUDE.md")]);
+    } finally {
+      fs.rmSync(u17, { recursive: true, force: true });
+      fs.rmSync(p17, { recursive: true, force: true });
+    }
+  });
+
+  await test("loadProjectMemory: 64K chars 软上限 — 超限截断+尾注+log 标记;恰好 64K 不截断", async () => {
+    const u17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-u-"));
+    const p17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-p-"));
+    try {
+      fs.writeFileSync(path.join(p17, "CLAUDE.md"), "x".repeat(70000));
+      const lines = [];
+      let mem = loadProjectMemory({ userDir: u17, projectRoot: p17, log: (l) => lines.push(l) });
+      assert.strictEqual(mem.sources[0].truncated, true);
+      const tail = "…(已截断, 原文 70000 chars)";
+      assert.ok(mem.text.endsWith(tail), `尾注缺失: …${mem.text.slice(-30)}`);
+      assert.strictEqual(mem.text.length, 64 * 1024 + tail.length, "截断后长度 = 64K + 尾注");
+      assert.ok(mem.text.startsWith("x".repeat(100)), "前缀保留");
+      assert.ok(lines.some((l) => l.includes("[已截断]")), lines.join("\n"));
+      fs.writeFileSync(path.join(p17, "CLAUDE.md"), "y".repeat(64 * 1024));
+      mem = loadProjectMemory({ userDir: u17, projectRoot: p17, log: () => {} });
+      assert.strictEqual(mem.sources[0].truncated, false, "边界值不截断");
+      assert.strictEqual(mem.text.length, 64 * 1024);
+      assert.ok(!mem.text.includes("已截断"));
+    } finally {
+      fs.rmSync(u17, { recursive: true, force: true });
+      fs.rmSync(p17, { recursive: true, force: true });
+    }
+  });
+
+  await test("loadProjectMemory: 全部缺失 → 空串 + 零 sources + 零日志(静默, 同 settings 缺层语义)", async () => {
+    const u17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-u-"));
+    const p17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-p-"));
+    try {
+      const lines = [];
+      const mem = loadProjectMemory({ userDir: u17, projectRoot: p17, log: (l) => lines.push(l) });
+      assert.strictEqual(mem.text, "");
+      assert.deepStrictEqual(mem.sources, []);
+      assert.strictEqual(lines.length, 0, "缺失 = 最常见形态, 不产生噪音");
+    } finally {
+      fs.rmSync(u17, { recursive: true, force: true });
+      fs.rmSync(p17, { recursive: true, force: true });
+    }
+  });
+
+  await test("composeSystemPrompt: memory 段序 = settings 追加段之后、CLI 追加之前、模式后缀永远最后", async () => {
+    const prompt = composeSystemPrompt("BASE", { systemPromptAppend: "APPEND" }, { memory: "MEMORY", cliAppend: "CLI", modeSuffix: "SUFFIX" });
+    assert.strictEqual(prompt, "BASE\n\nAPPEND\n\nMEMORY\n\nCLI\n\nSUFFIX");
+    assert.strictEqual(
+      composeSystemPrompt("BASE", { systemPromptAppend: "" }, { memory: "MEMORY" }),
+      "BASE\n\nMEMORY",
+      "仅 memory 段"
+    );
+    assert.strictEqual(
+      composeSystemPrompt("BASE", { systemPromptAppend: "APPEND" }, { cliAppend: "CLI" }),
+      "BASE\n\nAPPEND\n\nCLI",
+      "不传 memory 兼容旧调用(不产生空洞)"
+    );
+  });
+
+  await test("loadProjectMemory: AGENT_HARNESS_HOME 重定向(不传 userDir 时与 settings 层同源)", async () => {
+    const envUser17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-env-"));
+    const emptyP17 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mem-p2-"));
+    fs.writeFileSync(path.join(envUser17, "CLAUDE.md"), "重定向记忆");
+    const savedHome17 = process.env.AGENT_HARNESS_HOME;
+    process.env.AGENT_HARNESS_HOME = envUser17;
+    try {
+      const mem = loadProjectMemory({ projectRoot: emptyP17, log: () => {} });
+      assert.strictEqual(mem.text, "重定向记忆");
+      assert.deepStrictEqual(mem.sources.map((s) => s.path), [path.join(envUser17, "CLAUDE.md")]);
+    } finally {
+      if (savedHome17 === undefined) delete process.env.AGENT_HARNESS_HOME;
+      else process.env.AGENT_HARNESS_HOME = savedHome17;
+      fs.rmSync(envUser17, { recursive: true, force: true });
+      fs.rmSync(emptyP17, { recursive: true, force: true });
+    }
+  });
+
   fs.rmSync(headlessHome, { recursive: true, force: true });
 
   fs.rmSync(dirS, { recursive: true, force: true });
