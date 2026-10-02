@@ -31,6 +31,9 @@ export interface CacheSafeParams {
   tools: ToolSchema[];
   messages: Message[];
   max_tokens: number;
+  // 消息历史稳定边界(可选): [0, breakpoint) 为压缩层改树后的稳定前缀段,
+  // 后续轮次只追加不变化 → 该段可独立命中服务端 KV cache(对应真实请求体的第 3 断点)
+  cacheBreakpoint?: number;
 }
 
 // DYNAMIC BOUNDARY 标记: 稳定前缀与动态部分的分界线
@@ -39,6 +42,8 @@ export const DYNAMIC_BOUNDARY = "\n<<<DYNAMIC BOUNDARY>>>\n";
 export interface BuiltRequest {
   // 稳定前缀的指纹(模拟 cache_control 断点): 相同 key → 服务端前缀复用
   prefixKey: string;
+  // 消息前缀段指纹(有边界时存在): 相同 key → 消息历史稳定段命中 cache
+  messagePrefixKey?: string;
   body: string;
 }
 
@@ -50,8 +55,15 @@ export function buildRequest(p: CacheSafeParams): BuiltRequest {
     tools: p.tools,
   });
   const dynamic = stableStringify({ messages: p.messages });
+  // 消息前缀段指纹: 只覆盖 [0, breakpoint), 边界后追加/变化不影响 → 分段命中判定
+  const bp = p.cacheBreakpoint;
+  const hasBoundary = bp != null && bp >= 0 && bp <= p.messages.length;
+  const messagePrefixKey = hasBoundary
+    ? createHash("sha256").update(stableStringify(p.messages.slice(0, bp as number))).digest("hex").slice(0, 16)
+    : undefined;
   return {
     prefixKey: createHash("sha256").update(prefix).digest("hex").slice(0, 16),
+    messagePrefixKey,
     body: prefix + DYNAMIC_BOUNDARY + dynamic,
   };
 }

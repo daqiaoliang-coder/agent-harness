@@ -31,6 +31,10 @@ export interface LoopState {
   t1ClearedIds: Set<string>; // 已进入 T1 清除范围的结果(遥测去重: 视图每轮重建)
   warned: boolean;
   lastPrefixKey: string | null;
+  // 消息历史稳定边界(第 3 cache 断点): T2/T3/T4/T5 任一压缩层成功改树后重置到树尾,
+  // [0, boundary) 在后续轮次只追加不变化; 正常轮次消息树只 append, 边界保持
+  cacheBoundaryIndex: number | null;
+  lastMessagePrefixKey: string | null; // [cache] p2 分段命中判定的上一轮指纹
   turnCount: number;
   totalTokensUsed: number; // 会话累计计费 tokens(预算熔断依据; 跨 send 持续累计)
 }
@@ -72,6 +76,8 @@ export function initLoopState(): LoopState {
     t1ClearedIds: new Set(),
     warned: false,
     lastPrefixKey: null,
+    cacheBoundaryIndex: null,
+    lastMessagePrefixKey: null,
     turnCount: 0,
     totalTokensUsed: 0,
   };
@@ -129,6 +135,7 @@ export async function runQuery(
       const t2 = snipCompact(state.messages, tokens, deps.cfg, deps.artifactsDir);
       if (t2.archived > 0) {
         state.messages = t2.messages;
+        state.cacheBoundaryIndex = state.messages.length; // 压缩改树 → 边界重置到树尾(统一规则)
         state.archivedFiles.push(...t2.files);
         tokens = viewTokens(deps, state.messages);
         deps.emit?.({ kind: "compact", level: "T2", detail: `snip 归档 ${t2.archived} 条消息, ${before} → ${tokens} tokens` });
@@ -145,6 +152,7 @@ export async function runQuery(
     );
     if (t3.folded) {
       state.messages = t3.messages;
+      state.cacheBoundaryIndex = state.messages.length; // 压缩改树 → 边界重置到树尾(统一规则)
       tokens = viewTokens(deps, state.messages);
     }
 
@@ -162,6 +170,7 @@ export async function runQuery(
             [...new Set(state.archivedFiles)], deps.log, deps.signal
           );
           state.messages = t4.messages;
+          state.cacheBoundaryIndex = state.messages.length; // 压缩改树 → 边界重置到树尾(统一规则)
           state.consecutiveAutoCompactFailures = 0;
           state.warned = false;
           tokens = viewTokens(deps, state.messages);
@@ -199,18 +208,29 @@ export async function runQuery(
       deps.log(`[compact] T1 micro: 新清除 ${newlyCleared.length} 个旧工具结果(API 层完成, 本地消息树不变)`);
     }
     const apiView = t1.messages;
+    // T1 microCompact 消息数量不变 → cacheBoundaryIndex 直接适用于 apiView, 无需索引换算
     const req = buildRequest({
       model: deps.model,
       system: deps.systemPrompt,
       tools: deps.tools.toSchemas(),
       messages: apiView,
       max_tokens: deps.cfg.maxOutputTokens,
+      cacheBreakpoint: state.cacheBoundaryIndex ?? undefined,
     });
+    // [cache] 两段判定: p1 = system+tools 稳定前缀; p2 = 消息历史稳定段(压缩边界后才有)
     if (state.lastPrefixKey === req.prefixKey) {
-      deps.log(`[cache] HIT  prefix=${req.prefixKey} (稳定前缀复用)`);
+      deps.log(`[cache] HIT  p1=${req.prefixKey} (稳定前缀复用)`);
     } else {
-      deps.log(`[cache] MISS prefix=${req.prefixKey}`);
+      deps.log(`[cache] MISS p1=${req.prefixKey}`);
       state.lastPrefixKey = req.prefixKey;
+    }
+    if (req.messagePrefixKey) {
+      if (state.lastMessagePrefixKey === req.messagePrefixKey) {
+        deps.log(`[cache] HIT  p2=${req.messagePrefixKey} (消息前缀段复用)`);
+      } else {
+        deps.log(`[cache] MISS p2=${req.messagePrefixKey}`);
+        state.lastMessagePrefixKey = req.messagePrefixKey;
+      }
     }
 
     deps.log(
@@ -241,6 +261,7 @@ export async function runQuery(
         maxTokens: deps.cfg.maxOutputTokens,
         tools: deps.tools.toSchemas(), // 真实 provider 需要工具定义(Mock 忽略)
         signal: deps.signal, // 用户中断: fetch 层中止(流式路径已渲染的 delta 保留)
+        cacheBreakpoint: state.cacheBoundaryIndex ?? undefined, // 第 3 断点透传(真实 provider 消费)
       };
       const completion = deps.provider.completeStream
         ? ((streamed = true), await deps.provider.completeStream(deps.systemPrompt, apiView, { ...callOpts, onTextDelta: deps.renderDelta }))
@@ -271,6 +292,7 @@ export async function runQuery(
         deps.emit?.({ kind: "compact", level: "T5", detail: "413 等价错误 → reactive compact(保留最后 4 条 + 全量摘要)" });
         deps.log("[compact] T5 reactive: 413 等价错误 → 只保留最后 4 条消息, 全量摘要");
         state.messages = await reactiveCompact(deps.provider, state.messages, deps.log, deps.signal);
+        state.cacheBoundaryIndex = state.messages.length; // 压缩改树 → 边界重置到树尾(统一规则)
         continue;
       }
       throw err;

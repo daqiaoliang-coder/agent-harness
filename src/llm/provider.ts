@@ -10,6 +10,10 @@ export interface CompleteOptions {
   tools?: ToolSchema[];
   // 用户中断信号(Ctrl-C / Web 停止): 中断中的请求以 RunAbortedError 抛出, 不重试
   signal?: AbortSignal;
+  // 消息历史稳定边界断点(第 3 cache 断点): 指定索引处消息的末 content block 加 cache_control;
+  // T2/T3/T4/T5 压缩层成功改树后由主循环重置到树尾(该时点前缀后续只追加不变化)。
+  // 真实 provider 消费; Mock 忽略(与 tools 同口径)
+  cacheBreakpoint?: number;
 }
 
 // 真实 API 的用量统计(prompt cache 遥测)

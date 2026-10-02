@@ -1,7 +1,8 @@
 // test/smoke.js — 冒烟测试(不依赖真实 API Key)
 // 1) Edit 工具全分支: 先读后改 / 多处匹配 / 唯一替换 / replace_all / 新鲜度校验 / Write 后直接 Edit
-// 2) AnthropicProvider 假服务端: 重试矩阵 / 413 与 prompt_too_long → ContextWindowExceededError /
-//    请求体形状(cache_control 断点 / tools 透传) / usage 遥测 / content 过滤
+// 2) AnthropicProvider 假服务端: 重试矩阵(非流式 + 流式三阶段) / 413 与 prompt_too_long →
+//    ContextWindowExceededError / 请求体形状(三 cache 断点: system / tools 末尾 / 消息边界) /
+//    SSE 聚合 / cutMid 半途断流重试语义(零 delta 重试, 已渲染不重试) / usage 遥测 / content 过滤
 // 6) AbortSignal 贯通: Bash 中止 / Provider 中断不重试 / 主循环中断后消息树一致 / 权限弹窗 race
 const assert = require("assert");
 const http = require("http");
@@ -190,6 +191,12 @@ async function test(name, fn) {
       const next = queue.shift() || { status: 200, body: {} };
       if (next.sse) {
         res.writeHead(next.status, { "content-type": "text/event-stream" });
+        if (next.cutMid) {
+          // 半途断流: 发出 sse 内容后销毁连接(客户端读到不完整流即抛错; 留时让客户端先消费已发数据)
+          res.write(next.sse);
+          setTimeout(() => res.destroy(), 50);
+          return;
+        }
         // 分 3 块发送, 模拟 fetch chunk 边界任意切断
         const s = next.sse;
         const cut1 = Math.floor(s.length / 3), cut2 = Math.floor((s.length * 2) / 3);
@@ -235,7 +242,14 @@ async function test(name, fn) {
       { type: "text", text: "你是助手\n规则补充", cache_control: { type: "ephemeral" } },
     ]);
     assert.deepStrictEqual(body.messages, MSGS);
-    assert.deepStrictEqual(body.tools, [{ name: "T1", description: "测试工具", input_schema: { type: "object", properties: {} } }]);
+    assert.deepStrictEqual(body.tools, [
+      {
+        name: "T1",
+        description: "测试工具",
+        input_schema: { type: "object", properties: {} },
+        cache_control: { type: "ephemeral" }, // tools 末尾断点(第 2 断点)
+      },
+    ]);
     assert.strictEqual(r.message.content.length, 1);
     assert.strictEqual(r.message.content[0].text, "ok");
     assert.strictEqual(r.usage.input_tokens, 10);
@@ -307,6 +321,95 @@ async function test(name, fn) {
   await test("SSE 413 → ContextWindowExceededError", async () => {
     queue.push({ status: 413, body: {} });
     await assert.rejects(() => mk(0).completeStream(SYS, MSGS, { maxTokens: 10 }), ContextWindowExceededError);
+  });
+
+  // ── 流式三阶段重试矩阵(阶段② 非 200 + 阶段③ 零 delta 中途断流) ──
+  const sseLine = (obj) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
+  const sseOk = (t) =>
+    [
+      sseLine({ type: "message_start", message: { usage: { input_tokens: 5 } } }),
+      sseLine({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+      sseLine({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: t } }),
+      sseLine({ type: "content_block_stop", index: 0 }),
+      sseLine({ type: "message_delta", delta: {}, usage: { output_tokens: 2 } }),
+      sseLine({ type: "message_stop" }),
+    ].join("");
+
+  await test("流式重试: 500 → 退避重试 → SSE 成功(deltas 无重复)", async () => {
+    const before = hits.length;
+    queue.push({ status: 500, body: {} }, { status: 200, sse: sseOk("重试后") });
+    const deltas = [];
+    const r = await mk(1).completeStream(SYS, MSGS, { maxTokens: 10, onTextDelta: (t) => deltas.push(t) });
+    assert.strictEqual(hits.length, before + 2, "非 200 阶段零渲染 → 重试(共 2 次请求)");
+    assert.deepStrictEqual(deltas, ["重试后"], "deltas 只含成功轮(无重复渲染)");
+    assert.strictEqual(r.message.content[0].text, "重试后");
+  });
+
+  await test("流式重试: 429 → 退避重试 → SSE 成功", async () => {
+    const before = hits.length;
+    queue.push({ status: 429, body: {} }, { status: 200, sse: sseOk("ok") });
+    const deltas = [];
+    await mk(1).completeStream(SYS, MSGS, { maxTokens: 10, onTextDelta: (t) => deltas.push(t) });
+    assert.strictEqual(hits.length, before + 2, "429 可重试 → 共 2 次请求");
+    assert.deepStrictEqual(deltas, ["ok"]);
+  });
+
+  await test("流式重试: cutMid 零 delta 渲染 → 从头重试 → 成功", async () => {
+    // 断流轮只发到 content_block_start(无 text_delta → emitted=0)
+    const cut = [
+      sseLine({ type: "message_start", message: { usage: { input_tokens: 5 } } }),
+      sseLine({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    ].join("");
+    const before = hits.length;
+    queue.push({ status: 200, sse: cut, cutMid: true }, { status: 200, sse: sseOk("安全") });
+    const deltas = [];
+    const r = await mk(1).completeStream(SYS, MSGS, { maxTokens: 10, onTextDelta: (t) => deltas.push(t) });
+    assert.strictEqual(hits.length, before + 2, "零 delta 断流 → 安全重试(共 2 次请求)");
+    assert.deepStrictEqual(deltas, ["安全"], "断流轮零渲染, deltas 只含成功轮");
+    assert.strictEqual(r.message.content[0].text, "安全");
+  });
+
+  await test("流式 cutMid 已渲染 1 个 delta → 不重试直接抛(已渲染文本保留)", async () => {
+    // 断流轮发 1 个 text_delta 后断(emitted=1 → UI 已有渐进输出)
+    const cut = [
+      sseLine({ type: "message_start", message: { usage: { input_tokens: 5 } } }),
+      sseLine({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+      sseLine({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "已渲染" } }),
+    ].join("");
+    const before = hits.length;
+    queue.push({ status: 200, sse: cut, cutMid: true });
+    const deltas = [];
+    await assert.rejects(
+      () => mk(1).completeStream(SYS, MSGS, { maxTokens: 10, onTextDelta: (t) => deltas.push(t) }),
+      (e) => !(e instanceof ContextWindowExceededError)
+    );
+    assert.strictEqual(hits.length, before + 1, "已渲染 delta → 重试必重复渲染 → 不重试");
+    assert.deepStrictEqual(deltas, ["已渲染"], "已渲染文本保留在 UI 语义(回调已收到)");
+  });
+
+  await test("流式 400 → 不重试直接抛", async () => {
+    const before = hits.length;
+    queue.push({ status: 400, body: { error: { message: "bad param" } } });
+    await assert.rejects(
+      () => mk(1).completeStream(SYS, MSGS, { maxTokens: 10 }),
+      (e) => e.message.includes("400") && !(e instanceof ContextWindowExceededError)
+    );
+    assert.strictEqual(hits.length, before + 1, "400 不可重试");
+  });
+
+  await test("请求体多断点: tools 末尾 + cacheBreakpoint 消息末块(深拷贝不污染树)", async () => {
+    queue.push({ status: 200, body: { content: [{ type: "text", text: "ok" }] } });
+    await mk(0).complete(SYS, MSGS, { maxTokens: 10, tools: TOOLS, cacheBreakpoint: 0 });
+    const b1 = hits[hits.length - 1].body;
+    assert.deepStrictEqual(b1.tools[b1.tools.length - 1].cache_control, { type: "ephemeral" }, "断点 2: tools 末尾");
+    assert.deepStrictEqual(b1.messages[0].content[0].cache_control, { type: "ephemeral" }, "断点 3: 边界消息末块");
+    assert.ok(!("cache_control" in MSGS[0].content[0]), "深拷贝: 原消息树不被污染");
+    // 无边界 → messages 无断点(tools 断点与边界无关)
+    queue.push({ status: 200, body: { content: [{ type: "text", text: "ok" }] } });
+    await mk(0).complete(SYS, MSGS, { maxTokens: 10, tools: TOOLS });
+    const b2 = hits[hits.length - 1].body;
+    assert.ok(!("cache_control" in b2.messages[0].content[0]), "无边界 → messages 无断点");
+    assert.deepStrictEqual(b2.tools[b2.tools.length - 1].cache_control, { type: "ephemeral" }, "tools 断点恒在");
   });
 
   server.close();
@@ -1897,6 +2000,161 @@ exit 1
     assert.ok(out14[0].includes("[usage]") && out14[0].includes("5h") && out14[0].includes("cache_read"), out14[0]);
     dispatchSlashCommand("/help", ctx14);
     assert.ok(out14.some((l) => l.includes("/usage")), "命令注册表应列出 /usage");
+  });
+
+  // ---------- Part 15: cache 多断点(消息历史稳定边界) ----------
+  console.log("[15] cache 多断点: messagePrefixKey 分段指纹 + 主循环边界透传/压缩后重置");
+  const { buildRequest } = require("../dist/context/cacheBoundary");
+
+  // Part 15 专用最小 deps(stub provider, 单轮 Stop; 返回 {deps, dir} 由调用方清理)
+  const mkDeps15 = (provider, cfg) => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-cache15-"));
+    const noHooks = new HookRunner(parseHookSettings({}), d, () => {});
+    const sessInfo = { sessionId: "s15", transcriptPath: path.join(d, "t.jsonl"), cwd: d };
+    return {
+      dir: d,
+      deps: {
+        provider,
+        tools: new ToolRegistry(),
+        permissions: new PermissionEngine({
+          rules: { allow: [], deny: [], ask: [] },
+          hooks: noHooks,
+          provider,
+          mode: "bypassPermissions",
+          userResponder: async () => "yes",
+          session: sessInfo,
+          log: () => {},
+        }),
+        hooks: noHooks,
+        cfg: cfg || DEMO_COMPACT_CONFIG,
+        systemPrompt: ["test"],
+        systemTokens: 1,
+        model: "m",
+        artifactsDir: d,
+        session: sessInfo,
+        getUserMessages: () => [],
+        log: () => {},
+      },
+    };
+  };
+
+  await test("buildRequest: 无边界无 p2; 有边界 → p1/p2 两段指纹独立", async () => {
+    const M = (t) => ({ role: "user", content: [{ type: "text", text: t }] });
+    const msgs = [M("m0"), M("m1"), M("m2"), M("m3")];
+    const P = { model: "m", system: ["s"], tools: [], max_tokens: 10 };
+    const none = buildRequest({ ...P, messages: msgs });
+    assert.strictEqual(none.messagePrefixKey, undefined, "无 cacheBreakpoint → 无消息段指纹");
+    const base = buildRequest({ ...P, messages: msgs, cacheBreakpoint: 2 });
+    assert.ok(base.messagePrefixKey, "有边界 → 消息段指纹存在");
+    const outside = buildRequest({ ...P, messages: [M("m0"), M("m1"), M("边界后已变"), M("m3")], cacheBreakpoint: 2 });
+    assert.strictEqual(outside.messagePrefixKey, base.messagePrefixKey, "边界后(index≥2)变化不影响 p2");
+    const inside = buildRequest({ ...P, messages: [M("边界内已变"), M("m1"), M("m2"), M("m3")], cacheBreakpoint: 2 });
+    assert.notStrictEqual(inside.messagePrefixKey, base.messagePrefixKey, "边界内(index<2)变化影响 p2");
+    const other = buildRequest({ ...P, messages: [M("完全不同的历史")], cacheBreakpoint: 1 });
+    assert.strictEqual(other.prefixKey, base.prefixKey, "messages 变化不影响 p1(system+tools 段)");
+  });
+
+  await test("runQuery 透传: cacheBoundaryIndex → provider opts.cacheBreakpoint(null → undefined)", async () => {
+    const seen = [];
+    const provider = {
+      name: "stub",
+      complete: async (_s, _m, opts) => {
+        seen.push(opts.cacheBreakpoint);
+        return { message: { role: "assistant", content: [{ type: "text", text: "done" }] } };
+      },
+    };
+    const { deps, dir } = mkDeps15(provider);
+    const state = initLoopState();
+    ["go", "ok", "again"].forEach((t, i) =>
+      state.messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: [{ type: "text", text: t }] })
+    );
+    state.cacheBoundaryIndex = 2; // 预置边界
+    await runQuery(deps, state, "user");
+    const state2 = initLoopState();
+    state2.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    await runQuery(deps, state2, "user");
+    assert.deepStrictEqual(seen, [2, undefined], "分支② 透传: 有边界传索引, 无边界传 undefined");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test("T5 后边界重置: 413 → reactiveCompact → 下轮透传新边界(压缩后树尾)", async () => {
+    const seen = [];
+    let calls = 0;
+    const provider = {
+      name: "stub",
+      complete: async (sys, _m, opts) => {
+        calls++;
+        seen.push(opts.cacheBreakpoint);
+        if (sys.join("\n").includes("[[REACTIVE]]")) {
+          return { message: { role: "assistant", content: [{ type: "text", text: "[reactive 摘要] 会话要点" }] } };
+        }
+        if (calls === 1) throw new ContextWindowExceededError(); // 第一次主调触发 T5
+        return { message: { role: "assistant", content: [{ type: "text", text: "done" }] } };
+      },
+    };
+    const { deps, dir } = mkDeps15(provider);
+    const state = initLoopState();
+    for (let i = 0; i < 6; i++) {
+      state.messages.push({ role: i % 2 ? "assistant" : "user", content: [{ type: "text", text: `消息 ${i}` }] });
+    }
+    const out = await runQuery(deps, state, "user");
+    assert.strictEqual(calls, 3, "主调 413 + REACTIVE 侧查 + 主调 done");
+    assert.deepStrictEqual(seen, [undefined, undefined, 1], "T5 改树后下轮透传新边界(压缩后树长 1)");
+    assert.strictEqual(state.cacheBoundaryIndex, 1, "边界 = T5 压缩后树尾");
+    assert.strictEqual(out.messages.length, 2, "摘要消息 + done 回复");
+    assert.ok(out.messages[0].content[0].text.includes("[reactive compact summary]"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test("T4 后边界重置: autocompact → 下轮透传新边界(压缩后树尾)", async () => {
+    const cfg15 = {
+      ...DEMO_COMPACT_CONFIG,
+      contextWindow: 2_000, // effectiveWindow 1900
+      maxOutputTokens: 100,
+      autoCompactThreshold: 800, // autoCompactAt 1100(预载 ~1300 tokens 触发)
+      collapseLevels: [], // 关闭 T3(本例只验 T4)
+    };
+    const seen = [];
+    let calls = 0;
+    const provider = {
+      name: "stub",
+      complete: async (sys, _m, opts) => {
+        calls++;
+        seen.push(opts.cacheBreakpoint);
+        if (sys.join("\n").includes("[[AUTOCOMPACT]]")) {
+          return {
+            message: { role: "assistant", content: [{ type: "text", text: "<analysis>草稿</analysis>\n<summary>九段式摘要占位</summary>" }] },
+          };
+        }
+        return { message: { role: "assistant", content: [{ type: "text", text: "done" }] } };
+      },
+    };
+    const { deps, dir } = mkDeps15(provider, cfg15);
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "x".repeat(5200) }] }); // ~1306 tokens ≥ 1100
+    const out = await runQuery(deps, state, "user");
+    assert.strictEqual(calls, 2, "AUTOCOMPACT 侧查 + 主调 done");
+    assert.deepStrictEqual(seen, [undefined, 1], "T4 改树后下轮透传新边界(压缩后树长 1)");
+    assert.strictEqual(state.cacheBoundaryIndex, 1, "边界 = T4 压缩后树尾");
+    assert.strictEqual(out.messages.length, 2, "摘要消息 + done 回复");
+    assert.ok(out.messages[0].content[0].text.includes("[compact summary]"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test("[cache] 两段日志: p1 稳定前缀 + p2 消息前缀段(边界存在时)", async () => {
+    const logs = [];
+    const provider = { name: "stub", complete: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "done" }] } }) };
+    const { deps, dir } = mkDeps15(provider);
+    deps.log = (l) => logs.push(l);
+    const state = initLoopState();
+    ["go", "ok", "again"].forEach((t, i) =>
+      state.messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: [{ type: "text", text: t }] })
+    );
+    state.cacheBoundaryIndex = 2;
+    await runQuery(deps, state, "user");
+    assert.ok(logs.some((l) => /\[cache\] MISS p1=/.test(l)), "p1 稳定前缀日志存在");
+    assert.ok(logs.some((l) => /\[cache\] MISS p2=/.test(l)), "边界存在 → p2 消息前缀段日志存在");
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   fs.rmSync(headlessHome, { recursive: true, force: true });
