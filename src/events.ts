@@ -3,6 +3,14 @@
 import { Message } from "./types";
 import { PermissionPreview } from "./permissions/preview";
 
+// 任务清单条目(TodoWrite 工具维护, 全量替换语义)。
+// 定义在此防 import 环: todowrite.ts → events.ts 单向依赖, events.ts 不可反向 import
+export interface TodoItem {
+  content: string; // 步骤描述(祈使句)
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string; // 进行中描述(如 "正在重命名文件"); 前端 in_progress 时优先展示
+}
+
 export type UiEvent =
   // 会话元信息(SSE 连接建立 / 新建 / resume 后广播)
   | { kind: "ready"; sessionId: string; model: string; mode: string; provider: string }
@@ -45,6 +53,8 @@ export type UiEvent =
     }
   // 压缩管线触发(T0-T5)
   | { kind: "compact"; level: string; detail: string }
+  // 任务清单快照(TodoWrite 每次全量替换后外发; 前端渲染清单面板)
+  | { kind: "todos"; todos: TodoItem[] }
   // 引擎日志行(水位/usage/cache 等; 前端默认折叠)
   | { kind: "log"; text: string }
   | { kind: "error"; text: string }
@@ -52,6 +62,43 @@ export type UiEvent =
   | { kind: "aborted" }
   // 本轮 Stop(主循环跑到无工具调用; 前端关闭流式气泡)
   | { kind: "stop" };
+
+// 最后一次 TodoWrite 快照提取(逆向扫消息树)。
+// 轻量内联校验, 不 import todowrite.ts 防环; 非法写入在 execute 即失败不落状态,
+// 故最后校验通过的 tool_use 即最后成功清单(与 TodoWriteTool.restoreFrom 同一约定)
+function lastTodosSnapshot(messages: Message[]): TodoItem[] | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const blocks = [...messages[i].content].reverse();
+    for (const b of blocks) {
+      if (b.type !== "tool_use" || b.name !== "TodoWrite") continue;
+      const raw = (b.input as { todos?: unknown })?.todos;
+      if (!Array.isArray(raw)) continue;
+      const todos: TodoItem[] = [];
+      let valid = true;
+      for (const item of raw) {
+        if (typeof item !== "object" || item === null) {
+          valid = false;
+          break;
+        }
+        const rec = item as Record<string, unknown>;
+        if (
+          typeof rec.content !== "string" ||
+          rec.content.trim() === "" ||
+          typeof rec.status !== "string" ||
+          !["pending", "in_progress", "completed"].includes(rec.status)
+        ) {
+          valid = false;
+          break;
+        }
+        const t: TodoItem = { content: rec.content, status: rec.status as TodoItem["status"] };
+        if (typeof rec.activeForm === "string" && rec.activeForm.trim() !== "") t.activeForm = rec.activeForm;
+        todos.push(t);
+      }
+      if (valid) return todos;
+    }
+  }
+  return null;
+}
 
 // 历史回放: 消息树 → 事件序列(tool_use/tool_result 按 id 配对还原卡片)
 export function historyFromMessages(messages: Message[]): UiEvent[] {
@@ -79,6 +126,9 @@ export function historyFromMessages(messages: Message[]): UiEvent[] {
       }
     }
   }
+  // 末尾追加快照事件: resume 回放时前端清单面板与消息树状态对齐(最后成功清单)
+  const snapshot = lastTodosSnapshot(messages);
+  if (snapshot) events.push({ kind: "todos", todos: snapshot });
   return events;
 }
 

@@ -727,6 +727,68 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     server4.kill("SIGTERM");
     fs.rmSync(home20, { recursive: true, force: true });
 
+    // 21. TodoWrite e2e: 独立 spawn + AGENT_HARNESS_MOCK_SCRIPT 显式注入(2 轮: TodoWrite 全量清单 → 文本收尾)。
+    //     静态 allow → 全程无弹窗; SSE 收到 todos 快照事件(内容与 mock 写入一致)→ tool_result 非错 → stop
+    const PORT5 = 3995;
+    const BASE5 = `http://127.0.0.1:${PORT5}`;
+    const home21 = fs.mkdtempSync(path.join(os.tmpdir(), "web-smoke-home21-"));
+    const todos21 = [
+      { content: "步骤一", status: "completed" },
+      { content: "步骤二", status: "in_progress", activeForm: "正在执行步骤二" },
+      { content: "步骤三", status: "pending" },
+    ];
+    const server5 = spawn("node", ["dist/cli.js", "web"], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        ANTHROPIC_API_KEY: "",
+        PORT: String(PORT5),
+        AUTH_TOKEN: TOKEN,
+        AGENT_HARNESS_NO_KEYCHAIN: "1",
+        AGENT_HARNESS_HOME: home21,
+        AGENT_HARNESS_MOCK_SCRIPT: JSON.stringify([
+          { toolUses: [{ name: "TodoWrite", input: { todos: todos21 } }] },
+          { text: "清单已建立, 继续执行。" },
+        ]),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let server5Err = "";
+    server5.stderr.on("data", (d) => (server5Err += d.toString()));
+    let up5 = false;
+    for (let i = 0; i < 40 && !up5; i++) {
+      await sleep(250);
+      try {
+        await fetchJson("GET", "/api/sessions", undefined, TOKEN, BASE5);
+        up5 = true;
+      } catch { /* 等待启动 */ }
+    }
+    assert.ok(up5, `TodoWrite e2e 服务器未启动\nstderr: ${server5Err.slice(0, 1000)}`);
+    const sse21 = sseCollect(TOKEN, BASE5);
+    const ready21 = await sse21.waitFor((e) => e.kind === "ready");
+    const sess21 = ready21.sessionId;
+    const mark21 = sse21.events.length;
+    await fetchJson("POST", "/api/message", { text: "建个任务清单", sessionId: sess21 }, TOKEN, BASE5);
+    const todoStart21 = await sse21.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sess21 && e.name === "TodoWrite", 15000, mark21
+    );
+    const todosEv21 = await sse21.waitFor((e) => e.kind === "todos" && e.sessionId === sess21, 15000, mark21);
+    assert.deepStrictEqual(todosEv21.todos, todos21, "todos SSE 快照内容与 mock 写入一致(activeForm 保留)");
+    await sse21.waitFor(
+      (e) => e.kind === "tool_result" && e.sessionId === sess21 && e.id === todoStart21.id && !e.isError, 15000, mark21
+    );
+    await sse21.waitFor((e) => e.kind === "stop" && e.sessionId === sess21, 15000, mark21);
+    assert.strictEqual(
+      sse21.events.slice(mark21).filter((e) => e.kind === "permission_request" && e.sessionId === sess21).length,
+      0,
+      "TodoWrite 静态 allow → 全程无弹窗"
+    );
+    passed++; console.log("  ✓ TodoWrite e2e: todos SSE 快照(内容匹配)+ 静态 allow 无弹窗");
+
+    sse21.close();
+    server5.kill("SIGTERM");
+    fs.rmSync(home21, { recursive: true, force: true });
+
     sse.close();
     fs.rmSync(emptyHome, { recursive: true, force: true });
     console.log(`\n[web-smoke] 全部通过: ${passed} 项`);

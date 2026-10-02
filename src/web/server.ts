@@ -169,6 +169,7 @@ const webCommandCtx = (live: Live): CommandContext => ({
     `[status] 会话 ${live.id} | 权限模式 ${liveMode(live)}\n` +
     `[status] 轮次 ${live.session.state.turnCount} | 累计计费 tokens ${live.session.state.totalTokensUsed} | ` +
       `错误 ${getTelemetry(PROJECT_ROOT).sessionErrorCount(live.id)} 次\n` +
+    `[status] ${live.session.todosSummary()}\n` +
     `[status] transcript: ${live.session.transcriptPath}`,
   permissionsSummary: () => {
     const p = live.session.deps.permissions;
@@ -193,6 +194,18 @@ const webCommandCtx = (live: Live): CommandContext => ({
 // ── 会话初始化/切换 ──
 // model 解析序: env ANTHROPIC_MODEL > settings 分层合并(本地>项目>用户) > 内置默认(见 settings/loader)
 function makeProvider(merged: Pick<MergedSettings, "model">): { provider: LLMProvider; model: string; mode: PermissionMode; providerName: string } {
+  // 显式测试通道(与 headless 同契约): AGENT_HARNESS_MOCK_SCRIPT 优先于 API key — 防生产脚本静默 mock
+  const mockScript = process.env.AGENT_HARNESS_MOCK_SCRIPT;
+  if (mockScript) {
+    let turns: ScriptedTurn[];
+    try {
+      turns = JSON.parse(mockScript);
+    } catch (e) {
+      throw new Error(`AGENT_HARNESS_MOCK_SCRIPT 解析失败(须为 ScriptedTurn[] JSON): ${(e as Error).message}`);
+    }
+    console.log("[web] AGENT_HARNESS_MOCK_SCRIPT 显式注入 → mock 模式(测试通道)");
+    return { provider: new MockProvider(turns), model: "mock", mode: "default", providerName: "mock" };
+  }
   const resolved = resolveApiKey();
   if (resolved) {
     const model = resolveModel(merged);

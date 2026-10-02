@@ -64,6 +64,19 @@
   #ctx-wrap.danger #ctx-fill { background: var(--err); }
   #u5h-badge { cursor: pointer; }
   #u5h-badge:hover { border-color: var(--accent); color: var(--text); }
+  /* 任务清单面板(TodoWrite todos 事件驱动; 空清单隐藏) */
+  #todos {
+    max-width: 860px; width: calc(100% - 36px); margin: 10px auto 0;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 14px; font-family: var(--mono); font-size: 12px;
+  }
+  #todos[hidden] { display: none; }
+  #todos h4 { margin: 2px 0 6px; font-size: 10px; color: var(--dim); font-weight: 600; letter-spacing: .08em; }
+  #todos .todo { display: flex; gap: 8px; padding: 2px 0; color: var(--dim); }
+  #todos .todo .tk { width: 16px; text-align: center; flex-shrink: 0; }
+  #todos .todo.inp { color: var(--text); }
+  #todos .todo.inp .tk { color: var(--accent); }
+  #todos .todo.done span:last-child { text-decoration: line-through; opacity: .6; }
   #stream { flex: 1; overflow-y: auto; padding: 20px 18px 8px; scroll-behavior: smooth; }
   #stream-inner { max-width: 860px; margin: 0 auto; }
   /* 消息 */
@@ -183,6 +196,7 @@
       <span class="badge" id="u5h-badge" title="最近 5h 用量(点击查看明细)">5h <b id="u5h">–</b></span>
       <span id="conn" class="off">● connecting</span>
     </div>
+    <div id="todos" hidden></div>
     <div id="stream"><div id="stream-inner"></div></div>
     <div id="inputbar">
       <div id="inputwrap">
@@ -329,6 +343,22 @@ function permDecision(ev) {
 function sysLine(cls, text) {
   streamInner.appendChild(el("div", "sysline " + cls, text));
   scrollBottom();
+}
+
+// ── 渲染: 任务清单面板(TodoWrite 全量替换快照; 空清单隐藏; in_progress 优先展示 activeForm) ──
+const TODO_ICON = { pending: "☐", in_progress: "◐", completed: "☑" };
+function renderTodos(todos) {
+  const panel = $("todos");
+  if (!Array.isArray(todos) || todos.length === 0) { panel.hidden = true; return; }
+  panel.textContent = "";
+  panel.appendChild(el("h4", "", "todos"));
+  for (const t of todos) {
+    const row = el("div", "todo" + (t.status === "in_progress" ? " inp" : t.status === "completed" ? " done" : ""));
+    row.appendChild(el("span", "tk", TODO_ICON[t.status] ?? "☐"));
+    row.appendChild(el("span", "", t.status === "in_progress" && t.activeForm ? t.activeForm : t.content));
+    panel.appendChild(row);
+  }
+  panel.hidden = false;
 }
 
 // ── 权限模式徽章(下拉切换)与 slash 命令渲染 ──
@@ -537,6 +567,7 @@ function handleEvent(ev) {
     case "mode_changed": setModeBadge(ev.mode); break;      // 运行中模式切换 → 徽章同步(多标签页一致)
     case "usage": setUsage(ev); break;                      // 轮入口水位快照 → 水位条
     case "compact": sysLine("compact", `⇣ [${ev.level}] ${ev.detail}`); break;
+    case "todos": renderTodos(ev.todos); break;                  // TodoWrite 全量替换快照 → 清单面板
     case "log": sysLine("log", ev.text); break;
     case "error": sysLine("error", `✖ ${ev.text}`); setRunning(false); break;
     case "aborted": sysLine("aborted", "⏹ 已中断(可继续发送下一条消息)"); closeStream(); setRunning(false); break;

@@ -20,6 +20,7 @@ import { WriteTool } from "./tools/write";
 import { EditTool } from "./tools/edit";
 import { GlobTool } from "./tools/glob";
 import { GrepTool } from "./tools/grep";
+import { TodoWriteTool } from "./tools/todowrite";
 import { TaskTool } from "./tools/task";
 import { createExploreAgent } from "./agent/subagent";
 import { loadTranscript, repairTranscript } from "./session/resume";
@@ -61,7 +62,8 @@ const DEMO_SYSTEM_PROMPT = [
 
 const CHAT_SYSTEM_PROMPT = [
   "You are agent-harness, a minimal coding agent (architecture reference implementation)。",
-  "可用工具: Bash(执行命令), Read(读文件), Edit(精确替换编辑), Write(写文件), Glob(文件名匹配), Grep(内容搜索), Task(只读子代理调查)。",
+  "可用工具: Bash(执行命令), Read(读文件), Edit(精确替换编辑), Write(写文件), Glob(文件名匹配), Grep(内容搜索), TodoWrite(任务清单), Task(只读子代理调查)。",
+  "多步任务(≥3 步)先用 TodoWrite 建清单: 恰好保持一项 in_progress, 步骤状态变化时立即更新, 全部完成后标尽; 清单为全量替换(每次传完整清单)。",
   "查找文件优先用 Glob/Grep(只读免确认), 而非 Bash 的 find/grep。",
   "大范围调查类任务(如\"梳理某机制的所有相关文件\")用 Task 派发子代理, 独立上下文省 token。",
   "查看与修改文件用 Read/Edit/Write, 不要用 Bash 的 sed/echo 重定向改文件。",
@@ -91,6 +93,8 @@ export interface Session {
   // 中断当前运行中的 send(Ctrl-C / Web 停止按钮): LLM 请求/工具执行/压缩侧查询同轮中止,
   // 消息树一致性由引擎保证; 无运行中的 send 时为 no-op
   abort: () => void;
+  // 任务清单摘要(/status 用; commandCtx 在 runChat 构造, 拿不到 createSession 内部工具实例 → 经此暴露)
+  todosSummary: () => string;
   close: () => void; // 停 MCP 子进程 + 取消设置监听
 }
 
@@ -150,6 +154,13 @@ export async function createSession(opts: {
   tools.register(new EditTool());
   tools.register(new GlobTool());
   tools.register(new GrepTool());
+  // TodoWrite: 会话内任务清单(全量替换); 每会话独立实例 → 状态天然隔离。
+  // emit 桥接 UiEvent "todos"(web 前端清单面板); CLI 不传 emit → 仅 log 一行摘要
+  const todoTool = new TodoWriteTool({
+    emit: opts.emit ? (todos) => opts.emit?.({ kind: "todos", todos }) : undefined,
+    log: logS,
+  });
+  tools.register(todoTool);
   // Task: explore 型只读子代理(独立上下文); 子代理注册表不含 Task → 防无限嵌套
   tools.register(new TaskTool(createExploreAgent({
     provider: opts.provider,
@@ -205,6 +216,10 @@ export async function createSession(opts: {
       logS(`[resume] 崩溃一致性修复: 补齐孤儿 tool_use ${report.filledUses} 个 | 剔除孤儿 tool_result ${report.droppedResults} 个`);
     }
     logS("[resume] 压缩状态由水位检查派生重建; Edit 快照不恢复(需重新 Read)");
+    // 任务清单状态恢复: 取最后一次成功的 TodoWrite 写入(web 端快照另经 historyFromMessages 回放)
+    if (todoTool.restoreFrom(repaired)) {
+      logS(`[resume] 任务清单已恢复: ${todoTool.summary()}`);
+    }
   }
 
   // 会话驱动: 每条用户消息 → UserPromptSubmit Hook → 主循环跑到 Stop
@@ -292,6 +307,7 @@ export async function createSession(opts: {
     send,
     setMode,
     abort,
+    todosSummary: () => todoTool.summary(),
     close: () => {
       if (watchTimer) clearTimeout(watchTimer);
       watchers.forEach((w) => w.close());
@@ -525,6 +541,7 @@ async function runChat(): Promise<void> {
       `[status] 会话 ${chatSessionId} | 权限模式 ${session.deps.permissions.mode}\n` +
       `[status] 轮次 ${session.state.turnCount} | 累计计费 tokens ${session.state.totalTokensUsed} | ` +
         `错误 ${getTelemetry(PROJECT_ROOT).sessionErrorCount(chatSessionId)} 次\n` +
+      `[status] ${session.todosSummary()}\n` +
       `[status] transcript: ${session.transcriptPath}`,
     permissionsSummary: () => {
       const p = session.deps.permissions;

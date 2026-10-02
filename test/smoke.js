@@ -2157,6 +2157,135 @@ exit 1
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // ---------- Part 16: TodoWrite 任务清单(全量替换 + 静态放行 + resume 恢复) ----------
+  console.log("[16] TodoWrite: 全量替换语义 + status 校验 + plan 模式静态放行 + 消息树恢复");
+  const { TodoWriteTool } = require("../dist/tools/todowrite");
+
+  await test("全量替换: 两次 execute(3 项 → 2 项), getTodos 以最后一次为准 + emit 桥接", async () => {
+    const emitted = [];
+    const tool = new TodoWriteTool({ emit: (t) => emitted.push(t), log: () => {} });
+    const r1 = await tool.execute({
+      todos: [
+        { content: "步骤A", status: "completed" },
+        { content: "步骤B", status: "in_progress", activeForm: "正在做步骤B" },
+        { content: "步骤C", status: "pending" },
+      ],
+    });
+    assert.ok(!r1.isError, JSON.stringify(r1));
+    assert.strictEqual(tool.getTodos().length, 3);
+    const r2 = await tool.execute({
+      todos: [
+        { content: "步骤B", status: "completed" },
+        { content: "步骤C", status: "in_progress" },
+      ],
+    });
+    assert.ok(!r2.isError, JSON.stringify(r2));
+    const todos = tool.getTodos();
+    assert.strictEqual(todos.length, 2, "全量替换: 未包含项(步骤A)被移除");
+    assert.strictEqual(todos[0].content, "步骤B");
+    assert.strictEqual(todos[0].status, "completed");
+    assert.ok(!("activeForm" in todos[0]), "新清单未传 activeForm → 不保留上一轮值");
+    assert.strictEqual(todos[1].status, "in_progress");
+    assert.strictEqual(emitted.length, 2, "每次成功写入外发一次快照");
+    assert.deepStrictEqual(emitted[1], todos, "emit 内容与 getTodos 一致(拷贝)");
+  });
+
+  await test("status/content 非法 → isError 一次给全所有字段问题; 失败写入不落状态", async () => {
+    const tool = new TodoWriteTool();
+    const r = await tool.execute({ todos: [{ content: "a", status: "doing" }] });
+    assert.ok(r.isError, "非法 status → isError");
+    assert.ok(r.content.includes("pending | in_progress | completed"), "含合法枚举提示");
+    assert.strictEqual(tool.getTodos().length, 0, "失败写入不落状态");
+    const r2 = await tool.execute({ todos: "not-array" });
+    assert.ok(r2.isError && r2.content.includes("todos"), "todos 非数组同拒");
+    const r3 = await tool.execute({
+      todos: [
+        { content: "", status: "pending" },
+        { content: "ok", status: "bogus" },
+      ],
+    });
+    assert.ok(r3.isError);
+    assert.ok(
+      r3.content.includes("todos[0].content") && r3.content.includes("todos[1].status"),
+      "详细错误一次给全(两处字段问题都在)"
+    );
+  });
+
+  await test("checkPermissions 静态 allow: plan 模式经引擎仍放行(不弹窗不拒)", async () => {
+    const tool = new TodoWriteTool();
+    const sc = tool.checkPermissions({ todos: [] });
+    assert.strictEqual(sc.decision, "allow", "静态层直接 allow");
+    let asked = 0;
+    const d16 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-todo-"));
+    const hooks16 = new HookRunner(parseHookSettings({}), d16, () => {});
+    const engine16 = new PermissionEngine({
+      rules: { allow: [], deny: [], ask: [] },
+      hooks: hooks16,
+      provider: { name: "stub", complete: async () => ({}) },
+      mode: "plan",
+      userResponder: async () => {
+        asked++;
+        return "no";
+      },
+      session: { sessionId: "s16", transcriptPath: path.join(d16, "t.jsonl"), cwd: d16 },
+      log: () => {},
+    });
+    const outcome = await engine16.check(tool, { todos: [{ content: "a", status: "pending" }] }, []);
+    assert.strictEqual(outcome.decision, "allow", "plan 模式: 静态 allow 放行");
+    assert.strictEqual(outcome.source, "static");
+    assert.strictEqual(asked, 0, "静态 allow → 不触发用户弹窗");
+    fs.rmSync(d16, { recursive: true, force: true });
+  });
+
+  await test("execute 返回摘要 + log 通道; 空数组 = 清空清单", async () => {
+    const tool = new TodoWriteTool({ log: () => {} });
+    const r = await tool.execute({
+      todos: [
+        { content: "x", status: "completed" },
+        { content: "y", status: "in_progress" },
+        { content: "z", status: "pending" },
+      ],
+    });
+    assert.ok(!r.isError);
+    assert.ok(r.content.includes("3 项"), "摘要含总数");
+    assert.ok(r.content.includes("1 completed / 1 in_progress / 1 pending"), "摘要含分状态计数");
+    const r2 = await tool.execute({ todos: [] });
+    assert.ok(!r2.isError, "空数组合法(清空语义)");
+    assert.strictEqual(tool.getTodos().length, 0, "空数组清空清单");
+    assert.ok(tool.summary().includes("无"), "清空后 summary 显示无清单");
+    const logs = [];
+    const t2 = new TodoWriteTool({ log: (l) => logs.push(l) });
+    await t2.execute({ todos: [{ content: "a", status: "pending" }] });
+    assert.ok(logs.some((l) => l.includes("[todos]")), "log 通道输出 [todos] 摘要行");
+  });
+
+  await test("restoreFrom: 消息树取最后成功快照(非法跳过) + historyFromMessages 追加 todos 事件", async () => {
+    const { historyFromMessages } = require("../dist/events");
+    const mkUse = (id, todos) => ({ type: "tool_use", id, name: "TodoWrite", input: { todos } });
+    const tree = [
+      { role: "user", content: [{ type: "text", text: "开始" }] },
+      { role: "assistant", content: [mkUse("t1", [{ content: "步骤一", status: "completed" }, { content: "步骤二", status: "in_progress", activeForm: "正在做二" }])] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+      { role: "assistant", content: [mkUse("t2", [{ content: "仅剩", status: "pending" }])] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "ok" }] },
+      { role: "assistant", content: [mkUse("t3", [{ content: "坏", status: "bogus" }])] }, // 损坏写入 → 逆向扫描跳过
+    ];
+    const tool = new TodoWriteTool();
+    assert.strictEqual(tool.restoreFrom(tree), true, "找到合法快照");
+    const todos = tool.getTodos();
+    assert.strictEqual(todos.length, 1, "取最后一次合法快照(t2), 非法 t3 跳过");
+    assert.strictEqual(todos[0].content, "仅剩");
+    assert.strictEqual(todos[0].status, "pending");
+    const evs = historyFromMessages(tree);
+    const last = evs[evs.length - 1];
+    assert.strictEqual(last.kind, "todos", "history 末尾追加 todos 快照事件");
+    assert.deepStrictEqual(last.todos, todos, "快照事件与工具状态一致");
+    const empty = new TodoWriteTool();
+    assert.strictEqual(empty.restoreFrom([{ role: "user", content: [{ type: "text", text: "hi" }] }]), false, "无 TodoWrite → false");
+    const evs2 = historyFromMessages([{ role: "user", content: [{ type: "text", text: "hi" }] }]);
+    assert.ok(!evs2.some((e) => e.kind === "todos"), "无清单 → 不追加事件");
+  });
+
   fs.rmSync(headlessHome, { recursive: true, force: true });
 
   fs.rmSync(dirS, { recursive: true, force: true });
