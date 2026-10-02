@@ -33,8 +33,8 @@ export interface SubAgentOptions {
   log: (line: string) => void;
 }
 
-export function createExploreAgent(opts: SubAgentOptions): (prompt: string, maxTurns?: number) => Promise<string> {
-  return async (prompt: string, maxTurns = 12): Promise<string> => {
+export function createExploreAgent(opts: SubAgentOptions): (prompt: string, maxTurns?: number, signal?: AbortSignal) => Promise<string> {
+  return async (prompt: string, maxTurns = 12, signal?: AbortSignal): Promise<string> => {
     const sessionId = `sess_task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const transcriptPath = path.join(opts.sessionsDir, `${sessionId}.jsonl`);
     fs.writeFileSync(transcriptPath, "", "utf8");
@@ -67,6 +67,7 @@ export function createExploreAgent(opts: SubAgentOptions): (prompt: string, maxT
       session,
       getUserMessages: () => [prompt],
       log: opts.log,
+      signal, // 父级中断透传: 子代理的 LLM 调用/工具执行同轮中断
     };
 
     const state = initLoopState();

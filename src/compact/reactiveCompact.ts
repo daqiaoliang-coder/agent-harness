@@ -10,7 +10,8 @@ const REACTIVE_SYSTEM = `[[REACTIVE]] 你是紧急上下文压缩器。服务端
 export async function reactiveCompact(
   provider: LLMProvider,
   messages: Message[],
-  log: (line: string) => void
+  log: (line: string) => void,
+  signal?: AbortSignal
 ): Promise<Message[]> {
   // 只保留最后 4 条消息(生产实现: lastMessages(4))
   const last4 = messages.slice(-4);
@@ -18,7 +19,7 @@ export async function reactiveCompact(
     provider,
     [REACTIVE_SYSTEM],
     [{ role: "user", content: [{ type: "text", text: JSON.stringify(messages) }] }],
-    { maxTokens: 1024, log }
+    { maxTokens: 1024, log, signal }
   );
   log(`[compact] T5 reactive: 全量摘要完成, 保留最后 ${last4.length} 条消息上下文`);
   return [

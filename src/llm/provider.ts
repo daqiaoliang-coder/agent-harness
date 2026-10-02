@@ -7,6 +7,8 @@ export interface CompleteOptions {
   maxTokens: number;
   // 主循环传入工具定义(真实 provider 需要; Mock 忽略)
   tools?: ToolSchema[];
+  // 用户中断信号(Ctrl-C / Web 停止): 中断中的请求以 RunAbortedError 抛出, 不重试
+  signal?: AbortSignal;
 }
 
 // 真实 API 的用量统计(prompt cache 遥测)

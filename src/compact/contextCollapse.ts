@@ -24,7 +24,8 @@ export async function contextCollapse(
   wm: Watermarks,
   provider: LLMProvider,
   state: CollapseState,
-  log: (line: string) => void
+  log: (line: string) => void,
+  signal?: AbortSignal
 ): Promise<CollapseResult> {
   const tokens = estimateConversationTokens(messages);
   const pct = tokens / wm.effectiveWindow;
@@ -70,7 +71,7 @@ export async function contextCollapse(
     provider,
     ["[[COLLAPSE]] 你是上下文折叠器。将以下对话段压缩为 1-2 句关键信息摘要, 保留任何决策、错误与未完成事项:"],
     [{ role: "user", content: [{ type: "text", text: JSON.stringify(segment) }] }],
-    { maxTokens: 256, log }
+    { maxTokens: 256, log, signal }
   );
 
   const foldedMsg: Message = {

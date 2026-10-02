@@ -23,7 +23,8 @@ export async function classifyToolCall(
   userMessages: string[], // 用户消息(逐字) — 推理盲视的唯一上下文来源之一
   toolName: string,
   toolInput: Record<string, unknown>,
-  log: (line: string) => void
+  log: (line: string) => void,
+  signal?: AbortSignal
 ): Promise<ClassifyResult> {
   // 构造盲视输入: 用户消息 + 工具调用, 不含系统提示与历史
   const blindInput =
@@ -36,7 +37,7 @@ export async function classifyToolCall(
       provider,
       [STAGE1_SYSTEM],
       [{ role: "user", content: [{ type: "text", text: blindInput }] }],
-      { maxTokens: 4 }
+      { maxTokens: 4, signal }
     );
     // 容错解析: 真实模型可能输出 "Block." / "block\n" 等
     const verdict = (s1.toLowerCase().match(/\b(allow|block)\b/) ?? [])[0];
@@ -55,7 +56,7 @@ export async function classifyToolCall(
       provider,
       [STAGE2_SYSTEM],
       [{ role: "user", content: [{ type: "text", text: blindInput }] }],
-      { maxTokens: 512 }
+      { maxTokens: 512, signal }
     );
     const jsonMatch = s2.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {

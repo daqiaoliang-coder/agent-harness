@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { ToolResult } from "../types";
 import { Tool } from "./tool";
-import { markWritten } from "./fileState";
+import { markWritten, withFileLock } from "./fileState";
 
 export class WriteTool implements Tool {
   readonly name = "Write";
@@ -23,6 +23,11 @@ export class WriteTool implements Tool {
   }
 
   async execute(input: Record<string, unknown>): Promise<ToolResult> {
+    // 文件级互斥: 与并行 Edit/Write 串行(防整写覆盖丢失编辑)
+    return withFileLock(path.resolve(String(input.path ?? "")), () => this.run(input));
+  }
+
+  private async run(input: Record<string, unknown>): Promise<ToolResult> {
     const p = String(input.path ?? "");
     const content = String(input.content ?? "");
     try {

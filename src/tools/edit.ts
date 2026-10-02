@@ -1,9 +1,10 @@
 // 架构参考: Edit 工具 — 精确字符串替换(逐字符匹配, 含缩进)
 // + 先读后改(必须先 Read) + 编辑新鲜度校验(Read 后被外部修改则拒绝)
 import * as fs from "fs";
+import * as path from "path";
 import { ToolResult } from "../types";
 import { Tool } from "./tool";
-import { checkFreshness, markWritten } from "./fileState";
+import { checkFreshness, markWritten, withFileLock } from "./fileState";
 
 export class EditTool implements Tool {
   readonly name = "Edit";
@@ -25,6 +26,11 @@ export class EditTool implements Tool {
   }
 
   async execute(input: Record<string, unknown>): Promise<ToolResult> {
+    // 文件级互斥: 读-新鲜度校验-写 必须原子(并行工具调用下防同文件写-写竞态)
+    return withFileLock(path.resolve(String(input.path ?? "")), () => this.run(input));
+  }
+
+  private async run(input: Record<string, unknown>): Promise<ToolResult> {
     const p = String(input.path ?? "");
     const oldStr = String(input.old_string ?? "");
     const newStr = String(input.new_string ?? "");

@@ -32,3 +32,59 @@ export function loadTranscript(filePath: string): TranscriptData {
   }
   return { messages, userPrompts };
 }
+
+// ── 崩溃一致性修复 ──
+// transcript 为逐条追加(append-only): 进程在工具执行中崩溃 → 尾部出现"有 tool_use 无配对
+// tool_result"的半轮 → 消息树对 API 无效(400), 会话永久打不开。修复:
+//   · 孤儿 tool_use → 补一条 error tool_result 入树并持久化(幂等: 修复后再 load 无孤儿)
+//   · 孤儿 tool_result(assistant 行损坏被跳过导致) → 从内存树剔除该块(不改写既有行)
+export interface RepairReport {
+  filledUses: number; // 补齐的孤儿 tool_use 数
+  droppedResults: number; // 剔除的孤儿 tool_result 数
+}
+
+export function repairTranscript(filePath: string, messages: Message[]): { messages: Message[]; report: RepairReport } {
+  const useIds = new Set<string>();
+  const resultIds = new Set<string>();
+  for (const m of messages) {
+    for (const b of m.content) {
+      if (b.type === "tool_use") useIds.add(b.id);
+      else if (b.type === "tool_result") resultIds.add(b.tool_use_id);
+    }
+  }
+  const orphanUses = [...useIds].filter((id) => !resultIds.has(id));
+  const orphanResults = new Set([...resultIds].filter((id) => !useIds.has(id)));
+
+  let repaired = messages;
+  if (orphanResults.size > 0) {
+    repaired = repaired
+      .map((m) =>
+        m.role === "user" && m.content.some((b) => b.type === "tool_result" && orphanResults.has(b.tool_use_id))
+          ? {
+              ...m,
+              content: m.content.filter(
+                (b) => !(b.type === "tool_result" && orphanResults.has(b.tool_use_id))
+              ),
+            }
+          : m
+      )
+      .filter((m) => m.content.length > 0); // 剔空(纯孤儿 tool_result 的 user 消息)
+  }
+
+  if (orphanUses.length > 0) {
+    const fix: Message = {
+      role: "user",
+      content: orphanUses.map((id) => ({
+        type: "tool_result" as const,
+        tool_use_id: id,
+        content: "[crash recovery] 上轮工具执行中进程中断, 结果未落盘; 已补齐占位 error 结果以保持消息树有效。",
+        is_error: true,
+      })),
+    };
+    repaired = [...repaired, fix];
+    // 持久化到 transcript: 后续 resume 不再重复修复(幂等)
+    fs.appendFileSync(filePath, JSON.stringify({ ts: new Date().toISOString(), role: fix.role, content: fix.content }) + "\n", "utf8");
+  }
+
+  return { messages: repaired, report: { filledUses: orphanUses.length, droppedResults: orphanResults.size } };
+}

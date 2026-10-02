@@ -25,6 +25,8 @@ export type UiEvent =
   // 引擎日志行(水位/usage/cache 等; 前端默认折叠)
   | { kind: "log"; text: string }
   | { kind: "error"; text: string }
+  // 用户中断(Ctrl-C / Web 停止): 本轮提前收尾(消息树已保证一致)
+  | { kind: "aborted" }
   // 本轮 Stop(主循环跑到无工具调用; 前端关闭流式气泡)
   | { kind: "stop" };
 

@@ -5,7 +5,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
-import { Message } from "./types";
+import { Message, RunAbortedError } from "./types";
 import { estimateTokens } from "./context/tokenEstimator";
 import { LLMProvider, MockProvider, ScriptedTurn } from "./llm/provider";
 import { AnthropicProvider } from "./llm/anthropicProvider";
@@ -22,7 +22,7 @@ import { GlobTool } from "./tools/glob";
 import { GrepTool } from "./tools/grep";
 import { TaskTool } from "./tools/task";
 import { createExploreAgent } from "./agent/subagent";
-import { loadTranscript } from "./session/resume";
+import { loadTranscript, repairTranscript } from "./session/resume";
 import { McpServerConfig } from "./mcp/client";
 import { connectMcpServers } from "./mcp/manager";
 import {
@@ -33,6 +33,8 @@ import {
 } from "./compact/watermarks";
 import { initLoopState, runQuery, QueryDeps, LoopState } from "./query";
 import { UiEvent } from "./events";
+import { resolveApiKey, keychainStore, keychainLoad, keychainDelete } from "./credentials/keychain";
+import { getTelemetry } from "./telemetry/telemetry";
 
 const PROJECT_ROOT = process.cwd();
 const ARTIFACTS_DIR = path.join(PROJECT_ROOT, ".agent-harness", "artifacts");
@@ -68,6 +70,7 @@ interface LoadedSettings {
   rules: PermissionRules;
   hookSettings: HookSettings;
   mcpServers: Record<string, McpServerConfig>;
+  engine: { maxTurns?: number; tokenBudget?: number };
 }
 
 const SETTINGS_PATH = path.join(PROJECT_ROOT, "demo", "settings.json");
@@ -80,6 +83,7 @@ function loadSettings(): LoadedSettings {
     permissions?: { allow?: string[]; deny?: string[]; ask?: string[] };
     hooks?: unknown;
     mcpServers?: Record<string, McpServerConfig>;
+    engine?: { maxTurns?: number; tokenBudget?: number };
   };
   return {
     rules: {
@@ -89,6 +93,10 @@ function loadSettings(): LoadedSettings {
     },
     hookSettings: parseHookSettings(settings.hooks),
     mcpServers: settings.mcpServers ?? {},
+    engine: {
+      maxTurns: settings.engine?.maxTurns,
+      tokenBudget: settings.engine?.tokenBudget,
+    },
   };
 }
 
@@ -97,6 +105,9 @@ export interface Session {
   state: LoopState;
   transcriptPath: string;
   send: (text: string) => Promise<void>;
+  // 中断当前运行中的 send(Ctrl-C / Web 停止按钮): LLM 请求/工具执行/压缩侧查询同轮中止,
+  // 消息树一致性由引擎保证; 无运行中的 send 时为 no-op
+  abort: () => void;
   close: () => void; // 停 MCP 子进程 + 取消设置监听
 }
 
@@ -108,6 +119,8 @@ export async function createSession(opts: {
   rules: PermissionRules;
   hookSettings: HookSettings;
   mcpServers?: Record<string, McpServerConfig>;
+  // 引擎预算(settings.json engine 段): 轮次上限 + 会话累计 token 熔断
+  engine?: { maxTurns?: number; tokenBudget?: number };
   sessionId: string;
   mode: PermissionMode;
   // --resume: 从既有 transcript 重放消息树(压缩状态由水位检查派生重建)
@@ -168,6 +181,8 @@ export async function createSession(opts: {
   mcp.tools.forEach((t) => tools.register(t));
 
   const userPrompts: string[] = [];
+  // 错误遥测: 工具失败计数(query.ts) + 引擎级异常落盘(send catch); 进程级共享实例
+  const telemetry = getTelemetry(PROJECT_ROOT);
   const deps: QueryDeps = {
     provider: opts.provider,
     tools,
@@ -182,32 +197,61 @@ export async function createSession(opts: {
     getUserMessages: () => userPrompts.slice(),
     renderDelta: opts.renderDelta,
     emit: opts.emit,
+    maxTurns: opts.engine?.maxTurns,
+    tokenBudget: opts.engine?.tokenBudget,
+    telemetry,
     log: logS,
   };
   const state = initLoopState();
   if (opts.resume) {
     const data = loadTranscript(transcriptPath);
-    state.messages.push(...data.messages);
+    // 崩溃一致性修复: 孤儿 tool_use 补 error 结果(入树 + 落盘), 孤儿 tool_result 剔除
+    const { messages: repaired, report } = repairTranscript(transcriptPath, data.messages);
+    state.messages.push(...repaired);
     userPrompts.push(...data.userPrompts);
-    logS(`[resume] 已恢复 ${opts.sessionId}: 消息树 ${data.messages.length} 条 | 用户输入 ${data.userPrompts.length} 条 | transcript 追加续写`);
+    logS(`[resume] 已恢复 ${opts.sessionId}: 消息树 ${repaired.length} 条 | 用户输入 ${data.userPrompts.length} 条 | transcript 追加续写`);
+    if (report.filledUses > 0 || report.droppedResults > 0) {
+      logS(`[resume] 崩溃一致性修复: 补齐孤儿 tool_use ${report.filledUses} 个 | 剔除孤儿 tool_result ${report.droppedResults} 个`);
+    }
     logS("[resume] 压缩状态由水位检查派生重建; Edit 快照不恢复(需重新 Read)");
   }
 
   // 会话驱动: 每条用户消息 → UserPromptSubmit Hook → 主循环跑到 Stop
+  // 每次 send 持有独立 AbortController → abort() 只中断当前轮, 不影响后续消息
+  let currentAbort: AbortController | null = null;
   const send = async (text: string): Promise<void> => {
     logS(`── 用户: ${text.split("\n")[0].slice(0, 70)}${text.length > 70 ? " …" : ""}`);
-    await hooks.run("UserPromptSubmit", {}, session);
-    userPrompts.push(text);
-    const msg: Message = { role: "user", content: [{ type: "text", text }] };
-    state.messages.push(msg);
-    fs.appendFileSync(
-      transcriptPath,
-      JSON.stringify({ ts: new Date().toISOString(), role: "user", content: msg.content }) + "\n",
-      "utf8"
-    );
-    await runQuery(deps, state, "user");
-    logS("");
+    const ac = new AbortController();
+    currentAbort = ac;
+    deps.signal = ac.signal;
+    try {
+      await hooks.run("UserPromptSubmit", {}, session);
+      userPrompts.push(text);
+      const msg: Message = { role: "user", content: [{ type: "text", text }] };
+      state.messages.push(msg);
+      fs.appendFileSync(
+        transcriptPath,
+        JSON.stringify({ ts: new Date().toISOString(), role: "user", content: msg.content }) + "\n",
+        "utf8"
+      );
+      await runQuery(deps, state, "user");
+      logS("");
+    } catch (e) {
+      // 用户中断: 优雅收尾(不算故障) — 引擎已保证消息树/transcript 一致
+      if (e instanceof RunAbortedError) {
+        logS("⏹ 已中断(可继续输入下一条消息)");
+        opts.emit?.({ kind: "aborted" });
+        opts.emit?.({ kind: "stop" });
+        return;
+      }
+      telemetry.recordError(opts.sessionId, e); // 遥测: 引擎级异常分类 + JSONL 落盘(中断不计)
+      throw e;
+    } finally {
+      if (currentAbort === ac) currentAbort = null;
+      deps.signal = undefined;
+    }
   };
+  const abort = () => currentAbort?.abort();
 
   // 设置热加载(参考原版架构 settings 变更实时生效): fs.watch + 300ms 防抖 → 规则与 Hook 原地替换
   let watchTimer: NodeJS.Timeout | null = null;
@@ -232,6 +276,7 @@ export async function createSession(opts: {
     state,
     transcriptPath,
     send,
+    abort,
     close: () => {
       if (watchTimer) clearTimeout(watchTimer);
       watcher.close();
@@ -278,7 +323,7 @@ function buildScript(): ScriptedTurn[] {
 }
 
 async function runDemo(): Promise<void> {
-  const { rules, hookSettings, mcpServers } = loadSettings();
+  const { rules, hookSettings, mcpServers, engine } = loadSettings();
   const cfg = DEMO_COMPACT_CONFIG;
   const wm = computeWatermarks(cfg);
   const provider = new MockProvider(buildScript());
@@ -299,6 +344,7 @@ async function runDemo(): Promise<void> {
     rules,
     hookSettings,
     mcpServers,
+    engine,
     sessionId: "sess_demo_001",
     mode: "auto",
     userResponder: async (req) => {
@@ -325,9 +371,13 @@ async function runDemo(): Promise<void> {
 }
 
 async function runChat(): Promise<void> {
-  if (!process.env.ANTHROPIC_API_KEY) {
+  // key 解析: env ANTHROPIC_API_KEY > macOS Keychain(node dist/cli.js key set)
+  const resolved = resolveApiKey();
+  if (!resolved) {
     throw new Error(
-      "chat 模式需要 ANTHROPIC_API_KEY。可选: ANTHROPIC_MODEL(默认 claude-sonnet-4-5), ANTHROPIC_BASE_URL(网关)。demo 模式无需 key: npm run demo"
+      "chat 模式需要 API key: 推荐 `node dist/cli.js key set` 存入 macOS Keychain(避免明文 .env), " +
+      "或 export ANTHROPIC_API_KEY=…。可选: ANTHROPIC_MODEL(默认 claude-sonnet-4-5), ANTHROPIC_BASE_URL(网关)。" +
+      "demo 模式无需 key: npm run demo"
     );
   }
   // 参数: node dist/cli.js chat [--resume [sessionId]] [--plan]  (--resume 无 id → 取最近的会话)
@@ -355,14 +405,15 @@ async function runChat(): Promise<void> {
   }
 
   const model = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
-  const provider = new AnthropicProvider({ model, log });
+  const provider = new AnthropicProvider({ apiKey: resolved.apiKey, model, log });
   // 生产水位: 200K 窗口/32K 输出。chars/4 估算对 CJK 偏低 → 真实超限时由 413→T5 reactive compact 兜底
   const cfg = PRODUCTION_COMPACT_CONFIG;
   const wm = computeWatermarks(cfg);
-  const { rules, hookSettings, mcpServers } = loadSettings();
+  const { rules, hookSettings, mcpServers, engine } = loadSettings();
+  const chatSessionId = resumeSessionId ?? `sess_chat_${Date.now()}`;
 
   log("═══ agent-harness chat(真实 LLM) ═══");
-  log(`[config] model=${model} | effectiveWindow=${wm.effectiveWindow}, autoCompactAt=${wm.autoCompactAt}`);
+  log(`[config] model=${model} | API key 来源: ${resolved.source === "env" ? "环境变量" : "macOS Keychain"} | effectiveWindow=${wm.effectiveWindow}, autoCompactAt=${wm.autoCompactAt}`);
   if (planMode) {
     log("[config] Plan 模式: 只读探索(Read/Glob/Grep/Task/只读 Bash), Edit/Write/副作用命令一律拒绝");
   } else {
@@ -380,19 +431,49 @@ async function runChat(): Promise<void> {
     rules,
     hookSettings,
     mcpServers,
-    sessionId: resumeSessionId ?? `sess_chat_${Date.now()}`,
+    engine,
+    sessionId: chatSessionId,
     mode: planMode ? "plan" : "auto",
     resume: resumeSessionId !== null,
     renderDelta: (t) => process.stdout.write(t), // 流式渐进渲染
-    // 真实权限弹窗: 交互式确认(瀑布兜底层)
+    // 真实权限弹窗: 交互式确认(瀑布兜底层); 中断时以空行收尾挂起的 question(防吞下一行输入)
     userResponder: (req) =>
       new Promise((resolve) => {
+        const finish = (ans: string) => resolve(ans.trim().toLowerCase().startsWith("y") ? "yes" : "no");
+        const onAbort = () => rl.write("\n");
+        if (req.signal?.aborted) {
+          finish("");
+          return;
+        }
+        req.signal?.addEventListener("abort", onAbort, { once: true });
         rl.question(
           `\n[权限确认] ${req.toolName}(${JSON.stringify(req.toolInput).slice(0, 200)}): ${req.why}\n允许执行? (y/N) `,
-          (ans) => resolve(ans.trim().toLowerCase().startsWith("y") ? "yes" : "no")
+          (ans) => {
+            req.signal?.removeEventListener("abort", onAbort);
+            finish(ans);
+          }
         );
       }),
   });
+
+  // ── Ctrl-C: 运行中 → 优雅中断当前轮(再次 Ctrl-C 强制退出); 空闲 → 退出 ──
+  let busy = false;
+  let abortRequested = false;
+  const onInterrupt = () => {
+    if (busy) {
+      if (abortRequested) {
+        log("\n⏹ 强制退出");
+        process.exit(130);
+      }
+      abortRequested = true;
+      log("\n⏹ 中断当前任务…(再次 Ctrl-C 强制退出)");
+      session.abort();
+    } else {
+      rl.close();
+    }
+  };
+  rl.on("SIGINT", onInterrupt);
+  process.on("SIGINT", onInterrupt); // 非 readline 场景兜底(如 kill -INT)
 
   rl.prompt();
   rl.on("line", async (line) => {
@@ -405,31 +486,81 @@ async function runChat(): Promise<void> {
       rl.close();
       return;
     }
+    busy = true;
+    abortRequested = false;
     try {
       await session.send(text);
     } catch (e) {
       console.error(`[error] ${(e as Error).message}`);
+    } finally {
+      busy = false;
     }
     rl.prompt();
   });
   rl.on("close", () => {
+    // 退出摘要: 轮次/累计计费 tokens/错误次数(遥测; 中断不计)
+    const telem = getTelemetry(PROJECT_ROOT);
+    const errs = telem.sessionErrorCount(chatSessionId);
     log(`[session] 结束 | transcript: ${session.transcriptPath}`);
+    log(
+      `[stats] 轮次 ${session.state.turnCount} | 累计计费 tokens ${session.state.totalTokensUsed} | ` +
+        `错误 ${errs} 次${errs > 0 ? `(明细: ${telem.logFile})` : ""}`
+    );
     session.close();
     process.exit(0);
   });
   await new Promise(() => {}); // readline 自持事件循环
 }
 
+// ── key 子命令: API key 存取 macOS Keychain(避免明文 .env/shell export) ──
+//   node dist/cli.js key set    → 存入(交互输入, 或 ANTHROPIC_API_KEY=xxx 免交互)
+//   node dist/cli.js key get    → 脱敏显示 | key rm → 删除 | key status → 显示解析来源
+async function runKeyCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? "status";
+  if (sub === "set") {
+    let key = process.env.ANTHROPIC_API_KEY?.trim();
+    if (!key) {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      key = (
+        await new Promise<string>((resolve) =>
+          rl.question("Anthropic API key(sk-ant-…, 输入将回显; 免交互可用 ANTHROPIC_API_KEY=xxx key set): ", (a) => resolve(a.trim()))
+        )
+      );
+      rl.close();
+    }
+    if (!key) throw new Error("未输入 key");
+    keychainStore(key);
+    log("[key] 已存入 macOS Keychain(agent-harness/anthropic-api-key); chat/web 自动读取, env ANTHROPIC_API_KEY 优先");
+    return;
+  }
+  if (sub === "get") {
+    const key = keychainLoad();
+    if (!key) return log("[key] Keychain 无存储(先运行: node dist/cli.js key set)");
+    return log(`[key] ${key.slice(0, 8)}…${key.slice(-4)}(${key.length} chars)`);
+  }
+  if (sub === "rm") {
+    return log(keychainDelete() ? "[key] 已从 Keychain 删除" : "[key] Keychain 无存储(无需删除)");
+  }
+  if (sub === "status") {
+    const r = resolveApiKey();
+    if (process.env.ANTHROPIC_API_KEY?.trim()) return log("[key] 来源: 环境变量 ANTHROPIC_API_KEY");
+    if (r?.source === "keychain") return log("[key] 来源: macOS Keychain");
+    return log("[key] 未配置(env 与 Keychain 均无)— 运行 key set 或 export ANTHROPIC_API_KEY");
+  }
+  throw new Error(`未知子命令: ${sub} — 用法: node dist/cli.js key [set|get|rm|status]`);
+}
+
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "demo";
   if (mode === "demo") return runDemo();
   if (mode === "chat") return runChat();
+  if (mode === "key") return runKeyCommand(process.argv.slice(3));
   if (mode === "web") {
     // web 模式: SSE 服务器 + 单页前端(零依赖); lazy require 防循环依赖
     const { runWeb } = require("./web/server") as { runWeb: () => Promise<void> };
     return runWeb();
   }
-  console.error("用法: node dist/cli.js [demo|chat|web]");
+  console.error("用法: node dist/cli.js [demo|chat|web] | key [set|get|rm|status]");
   process.exit(1);
 }
 

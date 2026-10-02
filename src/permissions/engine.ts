@@ -32,6 +32,8 @@ export interface PermissionAsk {
   toolName: string;
   toolInput: Record<string, unknown>;
   why: string;
+  // 中断信号(可选): CLI 应答器可用其在中断时自动收尾挂起的输入等待
+  signal?: AbortSignal;
 }
 
 export interface PermissionOutcome {
@@ -51,7 +53,8 @@ export class PermissionEngine {
   async check(
     tool: Tool,
     toolInput: Record<string, unknown>,
-    userMessages: string[] // 供分类器盲视输入(用户消息逐字)
+    userMessages: string[], // 供分类器盲视输入(用户消息逐字)
+    signal?: AbortSignal // 用户中断信号: 中断等待弹窗应答/分类器查询
   ): Promise<PermissionOutcome> {
     const d = this.deps;
     const name = tool.name;
@@ -77,7 +80,7 @@ export class PermissionEngine {
       return { decision: "deny", source: "static", reason: staticCheck.reason ?? "静态检查拒绝" };
     }
     if (staticCheck.decision === "ask") {
-      const outcome = await this.askUser(name, toolInput, staticCheck.reason ?? "静态检查要求确认");
+      const outcome = await this.askUser(name, toolInput, staticCheck.reason ?? "静态检查要求确认", signal);
       if (outcome.decision === "deny") return outcome;
       return { decision: "allow", source: "user", reason: "用户确认放行(静态检查 ask)" };
     }
@@ -93,7 +96,7 @@ export class PermissionEngine {
       };
     }
     if (hook.decision === "ask") {
-      const outcome = await this.askUser(name, toolInput, hook.feedback ?? "Hook 要求用户确认");
+      const outcome = await this.askUser(name, toolInput, hook.feedback ?? "Hook 要求用户确认", signal);
       if (outcome.decision === "deny") return outcome;
       return { decision: "allow", source: "user", reason: "用户确认放行(Hook ask)" };
     }
@@ -114,7 +117,7 @@ export class PermissionEngine {
     // ⑤ ask 规则
     const rules2 = checkRules({ allow: [], deny: [], ask: d.rules.ask }, name, toolInput);
     if (rules2.decision === "ask") {
-      const outcome = await this.askUser(name, toolInput, `ask 规则 ${rules2.rule}`);
+      const outcome = await this.askUser(name, toolInput, `ask 规则 ${rules2.rule}`, signal);
       if (outcome.decision === "deny") return outcome;
       return { decision: "allow", source: "user", reason: `用户确认放行(ask 规则 ${rules2.rule})` };
     }
@@ -127,7 +130,7 @@ export class PermissionEngine {
 
     // ⑦ auto 模式分类器
     if (d.mode === "auto") {
-      const r = await classifyToolCall(d.provider, userMessages, name, toolInput, d.log);
+      const r = await classifyToolCall(d.provider, userMessages, name, toolInput, d.log, signal);
       if (r.decision === "deny") {
         await this.firePermissionDenied(name, toolInput, r.reason);
       }
@@ -135,17 +138,36 @@ export class PermissionEngine {
     }
 
     // ⑧ 用户弹窗(瀑布兜底)
-    const outcome = await this.askUser(name, toolInput, "无规则命中, 需要用户确认");
+    const outcome = await this.askUser(name, toolInput, "无规则命中, 需要用户确认", signal);
     return outcome;
   }
 
   private async askUser(
     toolName: string,
     toolInput: Record<string, unknown>,
-    why: string
+    why: string,
+    signal?: AbortSignal
   ): Promise<PermissionOutcome> {
     const d = this.deps;
-    const answer = await d.userResponder({ toolName, toolInput, why });
+    // 用户弹窗与中断信号 race: 中断时视作拒绝(挂起的弹窗 Promise 可能永不 resolve —
+    // Web 端浏览器无人应答, CLI 端中断优先于等待输入)
+    let answer: "yes" | "no" | "aborted";
+    if (signal) {
+      if (signal.aborted) {
+        return { decision: "deny", source: "abort", reason: "用户中断, 权限等待取消" };
+      }
+      answer = await Promise.race([
+        d.userResponder({ toolName, toolInput, why, signal }),
+        new Promise<"aborted">((resolve) =>
+          signal.addEventListener("abort", () => resolve("aborted"), { once: true })
+        ),
+      ]);
+      if (answer === "aborted") {
+        return { decision: "deny", source: "abort", reason: "用户中断, 权限等待取消" };
+      }
+    } else {
+      answer = await d.userResponder({ toolName, toolInput, why });
+    }
     if (answer === "no") {
       await this.firePermissionDenied(toolName, toolInput, why);
       return { decision: "deny", source: "user", reason: `用户弹窗拒绝: ${why}` };

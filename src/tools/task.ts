@@ -1,9 +1,10 @@
 // 架构参考: Task 工具 — 派发子代理在独立上下文中完成任务, 只回传最终报告
 // (父上下文省 token 的核心机制; 子代理工具集与防嵌套见 agent/subagent.ts)
 import { ToolResult } from "../types";
-import { Tool } from "./tool";
+import { Tool, ToolContext } from "./tool";
 
-export type SpawnAgent = (prompt: string, maxTurns?: number) => Promise<string>;
+// signal: 父级中断信号 → 透传给子代理主循环(中断传播)
+export type SpawnAgent = (prompt: string, maxTurns?: number, signal?: AbortSignal) => Promise<string>;
 
 export class TaskTool implements Tool {
   readonly name = "Task";
@@ -26,12 +27,12 @@ export class TaskTool implements Tool {
     return { decision: "allow" as const, reason: "Task 派发只读子代理" };
   }
 
-  async execute(input: Record<string, unknown>): Promise<ToolResult> {
+  async execute(input: Record<string, unknown>, ctx?: ToolContext): Promise<ToolResult> {
     const prompt = String(input.prompt ?? "");
     if (!prompt) return { content: "参数错误: 需要 prompt(给子代理的完整任务指令)", isError: true };
     const maxTurns = Math.min(Number(input.max_turns ?? 12) || 12, 50);
     try {
-      const report = await this.spawnAgent(prompt, maxTurns);
+      const report = await this.spawnAgent(prompt, maxTurns, ctx?.signal);
       return { content: report };
     } catch (e) {
       return { content: `子代理失败: ${(e as Error).message}`, isError: true };

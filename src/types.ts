@@ -20,3 +20,12 @@ export interface ToolResult {
 }
 
 export type PermissionDecision = "allow" | "deny" | "ask";
+
+// 用户中断(Ctrl-C / Web 停止按钮): 贯穿 provider → 工具 → 主循环的统一信号
+// 区别于普通错误: 捕获方需保证消息树/transcript 一致性后优雅收尾, 不算故障
+export class RunAbortedError extends Error {
+  constructor(reason = "用户中断") {
+    super(reason);
+    this.name = "RunAbortedError";
+  }
+}

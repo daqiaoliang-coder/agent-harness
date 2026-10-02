@@ -3,7 +3,7 @@
 // - completeStream: SSE 事件流解析(text_delta / input_json_delta 聚合为完整 message)
 // - 413 / prompt_too_long → ContextWindowExceededError(接通 T5 reactive compact 的真实路径)
 // - 429/5xx/529/网络错误(连接阶段) → 指数退避重试; 其余错误直接抛出
-import { ContentBlock, Message } from "../types";
+import { ContentBlock, Message, RunAbortedError } from "../types";
 import { CompleteOptions, CompleteResult, ContextWindowExceededError, LLMProvider, StreamOptions, UsageInfo } from "./provider";
 import { ToolSchema } from "../context/cacheBoundary";
 
@@ -18,6 +18,23 @@ export interface AnthropicProviderOptions {
 const RETRIABLE_STATUS = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
 const REQUEST_TIMEOUT_MS = 120_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// 组合信号: 外部中断(用户) 与 请求超时 任一触发即中止 fetch
+function combinedSignal(external: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; done: () => void } {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  if (!external) return { signal: ctrl.signal, done: () => clearTimeout(timer) };
+  const onAbort = () => ctrl.abort();
+  if (external.aborted) ctrl.abort();
+  else external.addEventListener("abort", onAbort, { once: true });
+  return {
+    signal: ctrl.signal,
+    done: () => {
+      clearTimeout(timer);
+      external.removeEventListener("abort", onAbort);
+    },
+  };
+}
 
 export class AnthropicProvider implements LLMProvider {
   readonly name: string;
@@ -72,6 +89,7 @@ export class AnthropicProvider implements LLMProvider {
     let lastErr: Error = new Error("AnthropicProvider: 不可达");
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       let res: Response;
+      const cs = combinedSignal(opts.signal, REQUEST_TIMEOUT_MS);
       try {
         res = await fetch(`${this.baseURL}/v1/messages`, {
           method: "POST",
@@ -81,9 +99,11 @@ export class AnthropicProvider implements LLMProvider {
             "anthropic-version": "2023-06-01",
           },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          signal: cs.signal,
         });
       } catch (e) {
+        // 用户中断 → 不重试, 直接抛 RunAbortedError
+        if (opts.signal?.aborted) throw new RunAbortedError();
         // 网络层错误(连接拒绝/超时/中断)→ 可重试
         lastErr = new Error(`Anthropic 网络错误: ${(e as Error).message}`);
         if (attempt < this.maxRetries) {
@@ -91,6 +111,8 @@ export class AnthropicProvider implements LLMProvider {
           continue;
         }
         throw lastErr;
+      } finally {
+        cs.done();
       }
 
       if (res.ok) {
@@ -124,6 +146,7 @@ export class AnthropicProvider implements LLMProvider {
   async completeStream(system: string[], messages: Message[], opts: StreamOptions): Promise<CompleteResult> {
     const body = this.buildBody(system, messages, opts, true);
     let res: Response;
+    const cs = combinedSignal(opts.signal, REQUEST_TIMEOUT_MS);
     try {
       res = await fetch(`${this.baseURL}/v1/messages`, {
         method: "POST",
@@ -133,10 +156,13 @@ export class AnthropicProvider implements LLMProvider {
           "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: cs.signal,
       });
     } catch (e) {
+      if (opts.signal?.aborted) throw new RunAbortedError();
       throw new Error(`Anthropic 网络错误: ${(e as Error).message}`);
+    } finally {
+      cs.done();
     }
     if (!res.ok || !res.body) {
       // 非 200: 复用非流式的错误分类(413 映射; 流式路径不重试 — 避免已渲染 delta 重复)
@@ -152,43 +178,49 @@ export class AnthropicProvider implements LLMProvider {
     const jsonBuf: string[] = []; // 每个 tool_use 块的 partial_json 累积(按 index)
     let usage: UsageInfo | undefined;
     let buf = "";
-    for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
-      buf += Buffer.from(chunk).toString("utf8");
-      const lines = buf.split("\n");
-      buf = lines.pop() ?? ""; // 末行可能不完整, 留到下一块
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const ev = this.parseSse(line.slice(5).trim());
-        if (!ev) continue;
-        if (ev.type === "content_block_start" && ev.index != null && ev.content_block) {
-          if (ev.content_block.type === "text") {
-            blocks[ev.index] = { type: "text", text: ev.content_block.text ?? "" };
-          } else if (ev.content_block.type === "tool_use") {
-            blocks[ev.index] = { type: "tool_use", id: ev.content_block.id, name: ev.content_block.name, input: {} };
-            jsonBuf[ev.index] = "";
+    try {
+      for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
+        buf += Buffer.from(chunk).toString("utf8");
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? ""; // 末行可能不完整, 留到下一块
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const ev = this.parseSse(line.slice(5).trim());
+          if (!ev) continue;
+          if (ev.type === "content_block_start" && ev.index != null && ev.content_block) {
+            if (ev.content_block.type === "text") {
+              blocks[ev.index] = { type: "text", text: ev.content_block.text ?? "" };
+            } else if (ev.content_block.type === "tool_use") {
+              blocks[ev.index] = { type: "tool_use", id: ev.content_block.id, name: ev.content_block.name, input: {} };
+              jsonBuf[ev.index] = "";
+            }
+          } else if (ev.type === "content_block_delta" && ev.index != null && ev.delta) {
+            if (ev.delta.type === "text_delta") {
+              (blocks[ev.index] as { type: "text"; text: string }).text += ev.delta.text;
+              opts.onTextDelta?.(ev.delta.text);
+            } else if (ev.delta.type === "input_json_delta" && ev.index != null) {
+              jsonBuf[ev.index] = (jsonBuf[ev.index] ?? "") + (ev.delta.partial_json ?? "");
+            }
+          } else if (ev.type === "content_block_stop" && ev.index != null && jsonBuf[ev.index] !== undefined) {
+            // tool_use 块结束 → 解析累积的 JSON 入参(空串 → 空 input)
+            try {
+              (blocks[ev.index] as { type: "tool_use"; input: Record<string, unknown> }).input = jsonBuf[ev.index]
+                ? JSON.parse(jsonBuf[ev.index])
+                : {};
+            } catch {
+              (blocks[ev.index] as { type: "tool_use"; input: Record<string, unknown> }).input = { _parse_error: jsonBuf[ev.index].slice(0, 200) };
+            }
+          } else if (ev.type === "message_start" && ev.message?.usage) {
+            usage = { ...ev.message.usage };
+          } else if (ev.type === "message_delta" && ev.usage) {
+            usage = { ...usage, ...ev.usage }; // output_tokens 在 message_delta 才有
           }
-        } else if (ev.type === "content_block_delta" && ev.index != null && ev.delta) {
-          if (ev.delta.type === "text_delta") {
-            (blocks[ev.index] as { type: "text"; text: string }).text += ev.delta.text;
-            opts.onTextDelta?.(ev.delta.text);
-          } else if (ev.delta.type === "input_json_delta" && ev.index != null) {
-            jsonBuf[ev.index] = (jsonBuf[ev.index] ?? "") + (ev.delta.partial_json ?? "");
-          }
-        } else if (ev.type === "content_block_stop" && ev.index != null && jsonBuf[ev.index] !== undefined) {
-          // tool_use 块结束 → 解析累积的 JSON 入参(空串 → 空 input)
-          try {
-            (blocks[ev.index] as { type: "tool_use"; input: Record<string, unknown> }).input = jsonBuf[ev.index]
-              ? JSON.parse(jsonBuf[ev.index])
-              : {};
-          } catch {
-            (blocks[ev.index] as { type: "tool_use"; input: Record<string, unknown> }).input = { _parse_error: jsonBuf[ev.index].slice(0, 200) };
-          }
-        } else if (ev.type === "message_start" && ev.message?.usage) {
-          usage = { ...ev.message.usage };
-        } else if (ev.type === "message_delta" && ev.usage) {
-          usage = { ...usage, ...ev.usage }; // output_tokens 在 message_delta 才有
         }
       }
+    } catch (e) {
+      // 流读取中途用户中断 → 已渲染的 delta 保留, 本轮以中断收尾
+      if (opts.signal?.aborted) throw new RunAbortedError();
+      throw e;
     }
     this.lastUsage = usage;
     return { message: { role: "assistant", content: blocks.filter(Boolean) }, usage };

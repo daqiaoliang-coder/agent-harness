@@ -2,7 +2,7 @@
 //   ① 压缩触发检查(T2/T3/T4 + 水位遥测)  ② LLM 调用(含 413 恢复路径)
 //   ③ 工具调用分发(权限瀑布)  ④ Stop(无工具调用)  ⑤ 错误升级/熔断
 import * as fs from "fs";
-import { Message, ToolResultBlock, ToolUseBlock } from "./types";
+import { Message, RunAbortedError, ToolResultBlock, ToolUseBlock } from "./types";
 import { estimateConversationTokens } from "./context/tokenEstimator";
 import { buildRequest } from "./context/cacheBoundary";
 import { LLMProvider, ContextWindowExceededError } from "./llm/provider";
@@ -17,6 +17,7 @@ import { PermissionEngine } from "./permissions/engine";
 import { HookRunner } from "./hooks/runner";
 import { ToolRegistry } from "./tools/tool";
 import { UiEvent } from "./events";
+import { Telemetry } from "./telemetry/telemetry";
 
 export type QuerySource = "user" | "compact";
 
@@ -30,6 +31,7 @@ export interface LoopState {
   warned: boolean;
   lastPrefixKey: string | null;
   turnCount: number;
+  totalTokensUsed: number; // 会话累计计费 tokens(预算熔断依据; 跨 send 持续累计)
 }
 
 export interface QueryDeps {
@@ -48,6 +50,14 @@ export interface QueryDeps {
   renderDelta?: (text: string) => void;
   // 结构化 UI 事件(可选): web 前端消费; CLI 不传, log 仍是唯一输出通道
   emit?: (e: UiEvent) => void;
+  // 用户中断信号(可选): Ctrl-C / Web 停止按钮 → 中断 LLM 请求/工具执行/压缩侧查询;
+  // 中断时保证消息树一致性(未完成的 tool_use 补 error 结果)后抛 RunAbortedError
+  signal?: AbortSignal;
+  // 引擎预算(可选, settings.json engine 段): 轮次上限与累计 token 熔断(失控保护)
+  maxTurns?: number;
+  tokenBudget?: number;
+  // 错误遥测(可选): 工具级失败计数(引擎级异常由 cli.ts createSession 统一记录)
+  telemetry?: Telemetry;
   log: (line: string) => void;
 }
 
@@ -62,6 +72,7 @@ export function initLoopState(): LoopState {
     warned: false,
     lastPrefixKey: null,
     turnCount: 0,
+    totalTokensUsed: 0,
   };
 }
 
@@ -83,12 +94,25 @@ export async function runQuery(
   deps: QueryDeps,
   state: LoopState,
   source: QuerySource,
-  maxTurns = 200
+  maxTurns?: number
 ): Promise<LoopState> {
   const wm = computeWatermarks(deps.cfg);
   const sess = deps.session;
+  // 轮次上限: 显式参数(子代理) > settings engine.maxTurns > 默认 200
+  const turns = maxTurns ?? deps.maxTurns ?? 200;
 
-  for (let turn = 0; turn < maxTurns; turn++) {
+  for (let turn = 0; turn < turns; turn++) {
+    // ── 用户中断检查(每轮入口; 中断在中途发生时由各阶段的 signal 检查/RunAbortedError 路径收尾) ──
+    if (deps.signal?.aborted) throw new RunAbortedError();
+
+    // ── 预算熔断: 会话累计 tokens 超限 → 拒绝下一轮请求(失控保护; 此时消息树必一致) ──
+    if (deps.tokenBudget && state.totalTokensUsed >= deps.tokenBudget) {
+      throw new Error(
+        `token 预算熔断: 本会话累计 ${state.totalTokensUsed} tokens ≥ 预算 ${deps.tokenBudget} ` +
+        `(settings.json engine.tokenBudget)。如需继续, 请调高预算后重启会话。`
+      );
+    }
+
     // ── 分支①: 压缩触发检查(每轮请求前) ──
     let tokens = viewTokens(deps, state.messages);
 
@@ -116,7 +140,7 @@ export async function runQuery(
 
     // T3 collapse: 90/92/94% 每水位折一段(渐进退化)
     const t3 = await contextCollapse(
-      state.messages, deps.cfg, wm, deps.provider, state.collapseState, deps.log
+      state.messages, deps.cfg, wm, deps.provider, state.collapseState, deps.log, deps.signal
     );
     if (t3.folded) {
       state.messages = t3.messages;
@@ -134,7 +158,7 @@ export async function runQuery(
         try {
           const t4 = await autoCompact(
             deps.provider, state.messages, deps.cfg,
-            [...new Set(state.archivedFiles)], deps.log
+            [...new Set(state.archivedFiles)], deps.log, deps.signal
           );
           state.messages = t4.messages;
           state.consecutiveAutoCompactFailures = 0;
@@ -200,16 +224,21 @@ export async function runQuery(
       const callOpts = {
         maxTokens: deps.cfg.maxOutputTokens,
         tools: deps.tools.toSchemas(), // 真实 provider 需要工具定义(Mock 忽略)
+        signal: deps.signal, // 用户中断: fetch 层中止(流式路径已渲染的 delta 保留)
       };
       const completion = deps.provider.completeStream
         ? ((streamed = true), await deps.provider.completeStream(deps.systemPrompt, apiView, { ...callOpts, onTextDelta: deps.renderDelta }))
         : await deps.provider.complete(deps.systemPrompt, apiView, callOpts);
-      // 真实 API 用量与 prompt cache 命中遥测
+      // 真实 API 用量与 prompt cache 命中遥测 + 预算累计(全部计费口径, 含 cache 读写)
       if (completion.usage) {
         const u = completion.usage;
+        state.totalTokensUsed +=
+          u.input_tokens + u.output_tokens +
+          (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
         deps.log(
           `[usage] in=${u.input_tokens} out=${u.output_tokens} ` +
-          `cache_read=${u.cache_read_input_tokens ?? 0} cache_create=${u.cache_creation_input_tokens ?? 0}`
+          `cache_read=${u.cache_read_input_tokens ?? 0} cache_create=${u.cache_creation_input_tokens ?? 0}` +
+          ` | 会话累计 ${state.totalTokensUsed}${deps.tokenBudget ? `/${deps.tokenBudget}` : ""} tokens`
         );
       }
       response = completion.message;
@@ -224,7 +253,7 @@ export async function runQuery(
         state.hasAttemptedReactiveCompact = true;
         deps.emit?.({ kind: "compact", level: "T5", detail: "413 等价错误 → reactive compact(保留最后 4 条 + 全量摘要)" });
         deps.log("[compact] T5 reactive: 413 等价错误 → 只保留最后 4 条消息, 全量摘要");
-        state.messages = await reactiveCompact(deps.provider, state.messages, deps.log);
+        state.messages = await reactiveCompact(deps.provider, state.messages, deps.log, deps.signal);
         continue;
       }
       throw err;
@@ -257,10 +286,17 @@ export async function runQuery(
     // ── 分支③: 工具调用分发 ──
     // 参考原版架构: 同轮多个 tool_use 并行执行(原版架构有并发上限与编辑互斥锁, 此处全并行简化);
     // 结果按 toolUses 序收集 → 消息树/transcript/cache 字节稳定
+    // 中断语义: signal 触发时, 未开始的工具跳过、执行中的工具尽快终止, 全部以 error 结果入树
+    // (tool_use 必须有配对的 tool_result, 否则消息树对 API 无效)
+    const sig = deps.signal;
     const runOne = async (tu: ToolUseBlock): Promise<ToolResultBlock> => {
       deps.emit?.({ kind: "tool_start", id: tu.id, name: tu.name, input: tu.input });
+      if (sig?.aborted) {
+        return { type: "tool_result", tool_use_id: tu.id, content: "用户中断, 未执行", is_error: true };
+      }
       const tool = deps.tools.get(tu.name);
       if (!tool) {
+        deps.telemetry?.recordToolError(); // 遥测: 未知工具(权限拒绝/中断不计 — 正常工作流)
         return {
           type: "tool_result",
           tool_use_id: tu.id,
@@ -268,35 +304,78 @@ export async function runQuery(
           is_error: true,
         };
       }
-      // 权限瀑布(deny 规则 → 静态检查 → PreToolUse Hook → bypass → ask/allow 规则 → 分类器 → 用户)
-      const perm = await deps.permissions.check(tool, tu.input, deps.getUserMessages());
-      deps.emit?.({ kind: "perm", id: tu.id, decision: perm.decision, source: perm.source, reason: perm.reason });
-      deps.log(
-        `[perm] ${tu.name}(${JSON.stringify(tu.input).slice(0, 80)}) → ${perm.decision.toUpperCase()} ` +
-        `(${perm.source}: ${perm.reason.slice(0, 90)})`
-      );
-      if (perm.decision !== "allow") {
-        // 权限拒绝处理: Hook 拒绝 → hook-blocking-error(系统提示声明: Hook 反馈视作用户本人反馈)
-        const isHook = perm.source === "hook";
+      try {
+        // 权限瀑布(deny 规则 → 静态检查 → PreToolUse Hook → bypass → ask/allow 规则 → 分类器 → 用户)
+        // 弹窗等待/分类器查询均与 signal race → 中断即拒
+        const perm = await deps.permissions.check(tool, tu.input, deps.getUserMessages(), sig);
+        deps.emit?.({ kind: "perm", id: tu.id, decision: perm.decision, source: perm.source, reason: perm.reason });
+        deps.log(
+          `[perm] ${tu.name}(${JSON.stringify(tu.input).slice(0, 80)}) → ${perm.decision.toUpperCase()} ` +
+          `(${perm.source}: ${perm.reason.slice(0, 90)})`
+        );
+        if (perm.decision !== "allow") {
+          // 权限拒绝处理: Hook 拒绝 → hook-blocking-error(系统提示声明: Hook 反馈视作用户本人反馈)
+          const isHook = perm.source === "hook";
+          return {
+            type: "tool_result",
+            tool_use_id: tu.id,
+            is_error: true,
+            content: isHook
+              ? `hook-blocking-error: ${perm.reason}\n该操作被 PreToolUse Hook 拒绝。Hook 反馈视作用户本人反馈, 请换一种方法达成目标。`
+              : `permission denied: ${perm.reason}\n请换一种方法, 或向用户说明需要手动执行。`,
+          };
+        }
+        // 执行与中断 race: 工具自行响应 signal(如 Bash kill 子进程); 不响应时由 race 兜底
+        const exec = sig
+          ? await Promise.race([
+              tool.execute(tu.input, { signal: sig }),
+              new Promise<{ content: string; isError?: boolean }>((resolve) =>
+                sig.addEventListener("abort", () => resolve({ content: "用户中断, 工具中止", isError: true }), { once: true })
+              ),
+            ])
+          : await tool.execute(tu.input);
+        if (exec.isError) deps.telemetry?.recordToolError(); // 遥测: 工具执行失败(计数不落盘)
+        await deps.hooks.run("PostToolUse", { toolName: tu.name, toolInput: tu.input }, sess);
         return {
           type: "tool_result",
           tool_use_id: tu.id,
-          is_error: true,
-          content: isHook
-            ? `hook-blocking-error: ${perm.reason}\n该操作被 PreToolUse Hook 拒绝。Hook 反馈视作用户本人反馈, 请换一种方法达成目标。`
-            : `permission denied: ${perm.reason}\n请换一种方法, 或向用户说明需要手动执行。`,
+          content: exec.content,
+          is_error: exec.isError,
         };
+      } catch (e) {
+        // 中断传播为 error 结果(而不是异常逃逸): 保证本轮 tool_use 全部有配对 tool_result
+        if (e instanceof RunAbortedError) {
+          return { type: "tool_result", tool_use_id: tu.id, content: "用户中断", is_error: true };
+        }
+        throw e;
       }
-      const exec = await tool.execute(tu.input);
-      await deps.hooks.run("PostToolUse", { toolName: tu.name, toolInput: tu.input }, sess);
-      return {
-        type: "tool_result",
-        tool_use_id: tu.id,
-        content: exec.content,
-        is_error: exec.isError,
-      };
     };
-    const results: ToolResultBlock[] = await Promise.all(toolUses.map((tu) => runOne(tu)));
+    // 并发上限(参考原版架构): 同轮 tool_use 并行执行, 超过上限的排队等待(防资源耗尽);
+    // 同文件的 Edit/Write 由 fileState 文件锁互斥; 结果仍按 toolUses 序收集 → 消息树稳定
+    const MAX_PARALLEL_TOOLS = 4;
+    let active = 0;
+    const slotQ: Array<() => void> = [];
+    const acquire = () =>
+      new Promise<void>((resolve) => {
+        if (active < MAX_PARALLEL_TOOLS) {
+          active++;
+          resolve();
+        } else slotQ.push(() => { active++; resolve(); });
+      });
+    const release = () => {
+      active--;
+      slotQ.shift()?.();
+    };
+    const results: ToolResultBlock[] = await Promise.all(
+      toolUses.map(async (tu) => {
+        await acquire();
+        try {
+          return await runOne(tu);
+        } finally {
+          release();
+        }
+      })
+    );
     // 结果统一外发(覆盖: 正常执行 / 权限拒绝 / 未知工具)
     results.forEach((r, i) => {
       deps.emit?.({
@@ -319,6 +398,8 @@ export async function runQuery(
     state.archivedFiles.push(...t0.archivedFiles);
     state.messages.push(t0.messages[0]);
     appendTranscript(deps, t0.messages[0]);
+    // 中断: 消息树已一致(本轮全部 tool_use 有配对 tool_result), 到此收尾抛中断
+    if (sig?.aborted) throw new RunAbortedError();
   }
-  throw new Error("runQuery: 超过最大轮次守卫");
+  throw new Error(`runQuery: 超过最大轮次守卫(${turns} 轮; settings.json engine.maxTurns 可调)`);
 }

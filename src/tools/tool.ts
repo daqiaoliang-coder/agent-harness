@@ -3,13 +3,19 @@ import { ToolResult } from "../types";
 import { ToolSchema } from "../context/cacheBoundary";
 import { StaticCheckResult } from "../permissions/staticChecks";
 
+// 执行上下文: 由主循环在每次工具调用时注入
+export interface ToolContext {
+  // 用户中断信号(Ctrl-C / Web 停止): 长时工具(如 Bash)应在收到信号时终止并返回
+  signal?: AbortSignal;
+}
+
 export interface Tool {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Record<string, unknown>;
   // 工具自身静态权限检查(瀑布第②层): 返回 null = 无意见
   checkPermissions(input: Record<string, unknown>): StaticCheckResult;
-  execute(input: Record<string, unknown>): Promise<ToolResult>;
+  execute(input: Record<string, unknown>, ctx?: ToolContext): Promise<ToolResult>;
 }
 
 export class ToolRegistry {

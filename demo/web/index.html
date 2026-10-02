@@ -90,6 +90,7 @@
   .sysline { font-family: var(--mono); font-size: 11px; color: var(--dim); margin: 3px 0; }
   .sysline.compact { color: var(--warn); }
   .sysline.error { color: var(--err); }
+  .sysline.aborted { color: var(--warn); }
   .sysline.log { display: none; }
   body.show-log .sysline.log { display: block; }
   /* 权限弹窗 */
@@ -130,6 +131,11 @@
     width: 34px; height: 34px; cursor: pointer; font-size: 15px; flex-shrink: 0;
   }
   #send:disabled { opacity: .4; cursor: default; }
+  #stop {
+    background: var(--err); border: 0; color: #fff; border-radius: 9px;
+    width: 34px; height: 34px; cursor: pointer; font-size: 12px; flex-shrink: 0; display: none;
+  }
+  #stop:hover { filter: brightness(1.15); }
   #inputbar label {
     display: flex; align-items: center; gap: 5px; max-width: 860px; margin: 6px auto 0;
     font-size: 11px; color: var(--dim); font-family: var(--mono); cursor: pointer; user-select: none;
@@ -154,6 +160,7 @@
       <div id="inputwrap">
         <textarea id="input" rows="1" placeholder="发送消息… (Enter 发送 / Shift+Enter 换行)"></textarea>
         <button id="send" title="发送">➤</button>
+        <button id="stop" title="中断当前任务">⏹</button>
       </div>
       <label><input type="checkbox" id="show-log"> 显示引擎日志(水位/cache/usage)</label>
     </div>
@@ -174,6 +181,21 @@
 
 <script>
 "use strict";
+// ── 鉴权 token: 首次从 URL ?token= 取得, 存 sessionStorage(同标签页刷新免重带) ──
+const urlParams = new URLSearchParams(location.search);
+const TOKEN = urlParams.get("token") ?? sessionStorage.getItem("ah-token") ?? "";
+if (TOKEN) sessionStorage.setItem("ah-token", TOKEN);
+if (!TOKEN) {
+  document.body.innerHTML =
+    '<div style="margin:auto;font:14px/1.8 -apple-system,sans-serif;color:#d7dae6;text-align:center">' +
+    "401 未授权 — 请使用服务启动时打印的带 <code>?token=</code> 的 URL 打开本页面</div>";
+  throw new Error("missing token");
+}
+// 所有 API 调用统一带 x-auth-token header
+function api(url, opts = {}) {
+  return fetch(url, { ...opts, headers: { ...(opts.headers ?? {}), "x-auth-token": TOKEN } });
+}
+
 // ── DOM 基础 ──
 const $ = (id) => document.getElementById(id);
 const streamInner = $("stream-inner"), streamEl = $("stream");
@@ -299,7 +321,7 @@ async function answerPerm(answer) {
   if (!cur) return;
   nextPerm();
   try {
-    await fetch(`/api/permission/${encodeURIComponent(cur.id)}`, {
+    await api(`/api/permission/${encodeURIComponent(cur.id)}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ answer }),
     });
@@ -314,7 +336,7 @@ document.addEventListener("keydown", (e) => {
 // ── 会话列表 ──
 async function refreshSessions() {
   try {
-    const r = await fetch("/api/sessions");
+    const r = await api("/api/sessions");
     const d = await r.json();
     const list = $("sess-list");
     list.textContent = "";
@@ -323,21 +345,57 @@ async function refreshSessions() {
         s.id.replace(/^sess_/, "") + " · " + new Date(s.mtime).toLocaleString());
       n.onclick = async () => {
         if (s.id === activeSess) return;
-        await fetch("/api/session/resume", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: s.id }),
-        });
+        try {
+          const r = await api("/api/session/resume", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId: s.id }),
+          });
+          const d = await r.json();
+          if (d.sessionId) await activateSession(d.sessionId);
+        } catch (e) { sysLine("error", `✖ 切换会话失败: ${e.message}`); }
       };
       list.appendChild(n);
     }
   } catch { /* 服务未就绪时静默 */ }
 }
+// 会话切换(多会话并发): 从 POST 响应立即锁定视图, 再显式拉取该会话回放
+// (确定性时序, 不依赖 SSE 广播与 fetch 的到达顺序); 附挂起弹窗与 running 态恢复
+async function activateSession(id) {
+  activeSess = id;
+  streamInner.textContent = "";
+  toolCards.clear();
+  closeStream();
+  setRunning(false);
+  $("m-sess").textContent = id.replace(/^sess_/, "");
+  try {
+    const r = await api(`/api/session/history?sessionId=${encodeURIComponent(id)}`);
+    if (!r.ok) { sysLine("error", "✖ 会话历史加载失败"); return; }
+    const d = await r.json();
+    $("m-model").textContent = d.model;
+    $("m-mode").textContent = d.mode;
+    d.events.forEach(handleEvent); // 回放该会话消息树
+    (d.pendingPerms ?? []).forEach(showPerm); // 该会话挂起的权限弹窗补放
+    setRunning(!!d.running); // 切到运行中的会话 → 停止按钮正确恢复
+    scrollBottom(true);
+    refreshSessions();
+  } catch (e) { sysLine("error", `✖ ${e.message}`); }
+}
 $("new-session").onclick = async () => {
-  await fetch("/api/session/new", { method: "POST" });
+  try {
+    const r = await api("/api/session/new", { method: "POST" });
+    const d = await r.json();
+    if (d.sessionId) await activateSession(d.sessionId);
+  } catch (e) { sysLine("error", `✖ 新建会话失败: ${e.message}`); }
 };
 
-// ── 事件分发 ──
+// ── 事件分发(多会话: 事件带 sessionId 标记, 只处理当前视图的会话) ──
+function relevant(ev) {
+  if (ev.sessionId === undefined) return true; // 未标记(回放内嵌事件) → 放行
+  if (!activeSess) return true;                // 初始连接(尚无视图) → 接受首个 ready
+  return ev.sessionId === activeSess;          // 其他会话的事件 → 过滤(多标签页各看各的)
+}
 function handleEvent(ev) {
+  if (!relevant(ev)) return;
   switch (ev.kind) {
     case "ready":
       $("m-model").textContent = ev.model;
@@ -361,8 +419,9 @@ function handleEvent(ev) {
     case "perm": permDecision(ev); break;
     case "compact": sysLine("compact", `⇣ [${ev.level}] ${ev.detail}`); break;
     case "log": sysLine("log", ev.text); break;
-    case "error": sysLine("error", `✖ ${ev.text}`); break;
-    case "stop": closeStream(); refreshSessions(); break;
+    case "error": sysLine("error", `✖ ${ev.text}`); setRunning(false); break;
+    case "aborted": sysLine("aborted", "⏹ 已中断(可继续发送下一条消息)"); closeStream(); setRunning(false); break;
+    case "stop": closeStream(); refreshSessions(); setRunning(false); break;
     case "permission_request": showPerm(ev); break;
     case "permission_resolved":
       if (permShowing && permShowing.id === ev.id) nextPerm();
@@ -370,9 +429,9 @@ function handleEvent(ev) {
   }
 }
 
-// ── SSE 连接 ──
+// ── SSE 连接(token 经 query — EventSource 不能设 header) ──
 function connect() {
-  const es = new EventSource("/api/events");
+  const es = new EventSource(`/api/events?token=${encodeURIComponent(TOKEN)}`);
   es.onopen = () => { $("conn").textContent = "● connected"; $("conn").className = "on"; };
   es.onerror = () => { $("conn").textContent = "● reconnecting"; $("conn").className = "off"; };
   es.onmessage = (m) => {
@@ -382,7 +441,21 @@ function connect() {
 connect();
 
 // ── 输入区 ──
-const input = $("input"), sendBtn = $("send");
+const input = $("input"), sendBtn = $("send"), stopBtn = $("stop");
+// 运行态: 发送后置真, stop/aborted/error 复位; 运行中发送钮变停止钮
+function setRunning(v) {
+  sendBtn.style.display = v ? "none" : "";
+  stopBtn.style.display = v ? "" : "none";
+}
+stopBtn.onclick = async () => {
+  try {
+    const r = await api("/api/abort", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: activeSess }), // 只中断当前视图的会话
+    });
+    if (!r.ok) { const d = await r.json(); sysLine("error", `✖ ${d.error || r.status}`); }
+  } catch (e) { sysLine("error", `✖ 中断请求失败: ${e.message}`); }
+};
 function autosize() {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 180) + "px";
@@ -392,11 +465,12 @@ async function send() {
   if (!text) return;
   input.value = ""; autosize();
   try {
-    const r = await fetch("/api/message", {
+    const r = await api("/api/message", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, sessionId: activeSess || undefined }), // 空视图 → 服务端用最近活动会话
     });
     if (!r.ok) { const d = await r.json(); sysLine("error", `✖ ${d.error || r.status}`); }
+    else setRunning(true);
   } catch (e) { sysLine("error", `✖ 发送失败: ${e.message}`); }
 }
 sendBtn.onclick = send;

@@ -35,14 +35,15 @@ export async function autoCompact(
   messages: Message[],
   cfg: CompactConfig,
   archivedFiles: string[], // T0/T2 落盘的文件(恢复预算候选)
-  log: (line: string) => void
+  log: (line: string) => void,
+  signal?: AbortSignal
 ): Promise<AutoCompactResult> {
   // 压缩子 Agent 看到完整本地历史(非 API 视图), 继承相同 system+tools(cache 前缀复用)
   const raw = await sideQuery(
     provider,
     [AUTOCOMPACT_SYSTEM],
     [{ role: "user", content: [{ type: "text", text: JSON.stringify(messages) }] }],
-    { maxTokens: cfg.summaryTokenCap, log }
+    { maxTokens: cfg.summaryTokenCap, log, signal }
   );
 
   // 双块解析: 注入时剥 <analysis> 草稿, 只保留 <summary>

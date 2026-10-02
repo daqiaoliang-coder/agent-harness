@@ -2,6 +2,7 @@
 // 1) Edit 工具全分支: 先读后改 / 多处匹配 / 唯一替换 / replace_all / 新鲜度校验 / Write 后直接 Edit
 // 2) AnthropicProvider 假服务端: 重试矩阵 / 413 与 prompt_too_long → ContextWindowExceededError /
 //    请求体形状(cache_control 断点 / tools 透传) / usage 遥测 / content 过滤
+// 6) AbortSignal 贯通: Bash 中止 / Provider 中断不重试 / 主循环中断后消息树一致 / 权限弹窗 race
 const assert = require("assert");
 const http = require("http");
 const fs = require("fs");
@@ -23,7 +24,7 @@ const { BashTool } = require("../dist/tools/bash");
 const { DEMO_COMPACT_CONFIG } = require("../dist/compact/watermarks");
 const { AnthropicProvider } = require("../dist/llm/anthropicProvider");
 const { ContextWindowExceededError } = require("../dist/llm/provider");
-const { loadTranscript } = require("../dist/session/resume");
+const { loadTranscript, repairTranscript } = require("../dist/session/resume");
 
 let passed = 0;
 async function test(name, fn) {
@@ -470,6 +471,461 @@ async function test(name, fn) {
     assert.ok(logs.some((l) => l.includes("bad") && l.includes("降级")));
     m.stop();
   });
+  // ---------- Part 6: AbortSignal 贯通 ----------
+  console.log("[6] AbortSignal 贯通");
+  const { RunAbortedError } = require("../dist/types");
+  const { ToolRegistry } = require("../dist/tools/tool");
+  const { initLoopState, runQuery } = require("../dist/query");
+
+  await test("Bash: 预中止 signal → 立即返回 aborted 结果", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const t0 = Date.now();
+    const r = await new BashTool().execute({ command: "sleep 3; echo done" }, { signal: ac.signal });
+    assert.ok(r.isError && r.content.includes("[aborted by user]"), JSON.stringify(r));
+    assert.ok(Date.now() - t0 < 1500, "应立即返回而非等满超时");
+  });
+
+  await test("Bash: 执行中 abort → SIGKILL 子进程尽快返回", async () => {
+    const ac = new AbortController();
+    const p = new BashTool().execute({ command: "sleep 3; echo done" }, { signal: ac.signal });
+    setTimeout(() => ac.abort(), 150);
+    const t0 = Date.now();
+    const r = await p;
+    assert.ok(r.isError && r.content.includes("[aborted by user]"), JSON.stringify(r));
+    assert.ok(Date.now() - t0 < 2000, "中止后应尽快返回(而非 3s 跑满)");
+  });
+
+  await test("Provider: 外部中断 → RunAbortedError 且不重试", async () => {
+    let hits = 0;
+    const slow = http.createServer((req, res) => {
+      hits++;
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ content: [], usage: {} }));
+      }, 5000);
+    });
+    await new Promise((r) => slow.listen(0, "127.0.0.1", r));
+    const p = new AnthropicProvider({
+      apiKey: "k",
+      baseURL: `http://127.0.0.1:${slow.address().port}`,
+      maxRetries: 2,
+      log: () => {},
+    });
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 100);
+    const t0 = Date.now();
+    await assert.rejects(
+      () => p.complete(["s"], [{ role: "user", content: [{ type: "text", text: "hi" }] }], { maxTokens: 10, signal: ac.signal }),
+      RunAbortedError
+    );
+    assert.ok(Date.now() - t0 < 2000, "中断应快速生效");
+    assert.strictEqual(hits, 1, "中断不触发重试");
+    slow.close();
+  });
+
+  await test("主循环: 工具执行中 abort → RunAbortedError + 消息树一致(tool_use 有配对结果)", async () => {
+    const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-abort-"));
+    const provider = new MockProvider([
+      { toolUses: [{ name: "Bash", input: { command: "sleep 3" } }] },
+      { text: "done" },
+    ]);
+    const tools = new ToolRegistry();
+    tools.register(new BashTool());
+    const noHooks = new HookRunner(parseHookSettings({}), dirA, () => {});
+    const sessInfo = { sessionId: "s", transcriptPath: path.join(dirA, "t.jsonl"), cwd: dirA };
+    const ac = new AbortController();
+    const deps = {
+      provider,
+      tools,
+      permissions: new PermissionEngine({
+        rules: { allow: [], deny: [], ask: [] },
+        hooks: noHooks,
+        provider,
+        mode: "bypassPermissions",
+        userResponder: async () => "yes",
+        session: sessInfo,
+        log: () => {},
+      }),
+      hooks: noHooks,
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: ["test"],
+      systemTokens: 1,
+      model: "m",
+      artifactsDir: dirA,
+      session: sessInfo,
+      getUserMessages: () => [],
+      log: () => {},
+      signal: ac.signal,
+    };
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    setTimeout(() => ac.abort(), 150);
+    await assert.rejects(() => runQuery(deps, state, "user"), RunAbortedError);
+    // 消息树一致性: 中断轮的 tool_use 必须有配对 error tool_result(否则对 API 无效)
+    const last = state.messages[state.messages.length - 1];
+    assert.strictEqual(last.role, "user");
+    assert.ok(
+      last.content.some((b) => b.type === "tool_result" && b.is_error),
+      `中断轮应有 error tool_result: ${JSON.stringify(last.content).slice(0, 200)}`
+    );
+    fs.rmSync(dirA, { recursive: true, force: true });
+  });
+
+  await test("权限弹窗: 永不应答的弹窗 + 中断 → 快速 deny(source=abort)", async () => {
+    const engine = new PermissionEngine({
+      rules: { allow: [], deny: [], ask: [] },
+      hooks: new HookRunner(parseHookSettings({}), process.cwd(), () => {}),
+      provider: new MockProvider([]),
+      mode: "default",
+      userResponder: () => new Promise(() => {}), // 模拟无人应答的浏览器
+      session: { sessionId: "s", transcriptPath: "/dev/null", cwd: process.cwd() },
+      log: () => {},
+    });
+    const ac = new AbortController();
+    const p = engine.check(new EditTool(), { path: "/tmp/x", old_string: "a", new_string: "b" }, [], ac.signal);
+    setTimeout(() => ac.abort(), 100);
+    const t0 = Date.now();
+    const outcome = await p;
+    assert.strictEqual(outcome.decision, "deny");
+    assert.strictEqual(outcome.source, "abort");
+    assert.ok(Date.now() - t0 < 2000, "中断应立即解锁权限等待");
+  });
+
+  // ---------- Part 7: 并发控制 / 预算熔断 / resume 崩溃修复 ----------
+  console.log("[7] 并发控制 / 预算熔断 / resume 崩溃修复");
+
+  await test("文件锁: 同文件并行 Edit 串行化 → 两处编辑都保留(无丢失)", async () => {
+    const dirC = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-lock-"));
+    const f = path.join(dirC, "same.txt");
+    fs.writeFileSync(f, "alpha beta gamma\n", "utf8");
+    await read.execute({ path: f }); // 先读后改(两个 Edit 共享同一 Read 快照)
+    // 并行两个不同区域的编辑; 无锁时两者都基于旧内容整写 → 后写覆盖先写(丢一处编辑)
+    const [r1, r2] = await Promise.all([
+      edit.execute({ path: f, old_string: "alpha", new_string: "ALPHA" }),
+      edit.execute({ path: f, old_string: "gamma", new_string: "GAMMA" }),
+    ]);
+    assert.ok(!r1.isError && !r2.isError, `两处编辑都应成功: ${JSON.stringify([r1, r2]).slice(0, 200)}`);
+    assert.strictEqual(fs.readFileSync(f, "utf8"), "ALPHA beta GAMMA\n", "两处编辑都应落盘(锁串行化)");
+    fs.rmSync(dirC, { recursive: true, force: true });
+  });
+
+  await test("并发上限: 同轮 6 个 tool_use → 在飞峰值 = 4(超出排队), 结果按序收集", async () => {
+    let active = 0;
+    let peak = 0;
+    const probe = {
+      name: "Probe",
+      description: "并发探测",
+      inputSchema: { type: "object", properties: {}, required: [] },
+      checkPermissions: () => ({ decision: "allow", reason: "probe" }),
+      execute: async () => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((r) => setTimeout(r, 50));
+        active--;
+        return { content: "ok" };
+      },
+    };
+    const provider = new MockProvider([
+      { toolUses: Array.from({ length: 6 }, () => ({ name: "Probe", input: {} })) },
+      { text: "done" },
+    ]);
+    const tools = new ToolRegistry();
+    tools.register(probe);
+    const noHooks = new HookRunner(parseHookSettings({}), os.tmpdir(), () => {});
+    const sessInfo = { sessionId: "s", transcriptPath: path.join(os.tmpdir(), `smoke-cap-${Date.now()}.jsonl`), cwd: os.tmpdir() };
+    const deps = {
+      provider,
+      tools,
+      permissions: new PermissionEngine({
+        rules: { allow: [], deny: [], ask: [] },
+        hooks: noHooks,
+        provider,
+        mode: "bypassPermissions",
+        userResponder: async () => "yes",
+        session: sessInfo,
+        log: () => {},
+      }),
+      hooks: noHooks,
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: ["test"],
+      systemTokens: 1,
+      model: "m",
+      artifactsDir: os.tmpdir(),
+      session: sessInfo,
+      getUserMessages: () => [],
+      log: () => {},
+    };
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    const out = await runQuery(deps, state, "user");
+    assert.strictEqual(peak, 4, `在飞峰值应为并发上限 4(实际 ${peak})`);
+    // Stop 轮后树尾是 assistant 文本 → 工具结果在最后一条 user 消息
+    const resultsMsg = [...out.messages].reverse().find((m) => m.role === "user");
+    assert.strictEqual(resultsMsg.content.filter((b) => b.type === "tool_result").length, 6, "6 个结果按序收集");
+  });
+
+  await test("预算熔断: 累计 tokens 超限 → 拒绝下一轮请求(消息树保持一致)", async () => {
+    let calls = 0;
+    const provider = {
+      name: "stub",
+      // 每次调用报 200 计费 tokens; 永远发起 tool_use → 循环只能被预算打断
+      complete: async () => {
+        calls++;
+        return {
+          message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_b_${calls}`, name: "Bash", input: { command: "echo hi" } }] },
+          usage: { input_tokens: 120, output_tokens: 80 },
+        };
+      },
+    };
+    const tools = new ToolRegistry();
+    tools.register(new BashTool());
+    const noHooks = new HookRunner(parseHookSettings({}), os.tmpdir(), () => {});
+    const sessInfo = { sessionId: "s", transcriptPath: path.join(os.tmpdir(), `smoke-budget-${Date.now()}.jsonl`), cwd: os.tmpdir() };
+    const deps = {
+      provider,
+      tools,
+      permissions: new PermissionEngine({
+        rules: { allow: [], deny: [], ask: [] },
+        hooks: noHooks,
+        provider,
+        mode: "bypassPermissions",
+        userResponder: async () => "yes",
+        session: sessInfo,
+        log: () => {},
+      }),
+      hooks: noHooks,
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: ["test"],
+      systemTokens: 1,
+      model: "m",
+      artifactsDir: os.tmpdir(),
+      session: sessInfo,
+      getUserMessages: () => [],
+      tokenBudget: 250, // 第 2 轮后累计 400 ≥ 250 → 第 3 轮入口熔断
+      log: () => {},
+    };
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    await assert.rejects(() => runQuery(deps, state, "user"), /预算熔断/);
+    assert.strictEqual(calls, 2, `熔断前应恰好 2 次调用(实际 ${calls})`);
+    assert.strictEqual(state.totalTokensUsed, 400, "累计计费 tokens 含全部调用");
+    // 熔断发生在轮入口 → 树尾必为完整 tool_result(对 API 有效)
+    const last = state.messages[state.messages.length - 1];
+    assert.strictEqual(last.role, "user");
+    assert.ok(last.content.every((b) => b.type === "tool_result"), "树尾应为完整工具结果消息");
+  });
+
+  await test("maxTurns 可配: deps.maxTurns=3 → 第 4 轮前熔断", async () => {
+    const provider = new MockProvider(
+      Array.from({ length: 5 }, () => ({ toolUses: [{ name: "Bash", input: { command: "echo hi" } }] }))
+    );
+    const tools = new ToolRegistry();
+    tools.register(new BashTool());
+    const noHooks = new HookRunner(parseHookSettings({}), os.tmpdir(), () => {});
+    const sessInfo = { sessionId: "s", transcriptPath: path.join(os.tmpdir(), `smoke-turns-${Date.now()}.jsonl`), cwd: os.tmpdir() };
+    const deps = {
+      provider,
+      tools,
+      permissions: new PermissionEngine({
+        rules: { allow: [], deny: [], ask: [] },
+        hooks: noHooks,
+        provider,
+        mode: "bypassPermissions",
+        userResponder: async () => "yes",
+        session: sessInfo,
+        log: () => {},
+      }),
+      hooks: noHooks,
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: ["test"],
+      systemTokens: 1,
+      model: "m",
+      artifactsDir: os.tmpdir(),
+      session: sessInfo,
+      getUserMessages: () => [],
+      maxTurns: 3,
+      log: () => {},
+    };
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    await assert.rejects(() => runQuery(deps, state, "user"), /超过最大轮次守卫\(3/);
+    assert.strictEqual(provider.mainCallCount, 3, "恰好在第 3 轮后停止");
+  });
+
+  await test("resume 崩溃修复: 尾部孤儿 tool_use → 补 error 结果 + 落盘幂等", async () => {
+    const dirD = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-repair-"));
+    const tf = path.join(dirD, "crash.jsonl");
+    fs.writeFileSync(
+      tf,
+      [
+        JSON.stringify({ ts: "t1", role: "user", content: [{ type: "text", text: "跑一下" }] }),
+        // 崩溃: assistant 发起 tool_use 但 tool_result 未落盘
+        JSON.stringify({ ts: "t2", role: "assistant", content: [{ type: "tool_use", id: "tu_x", name: "Bash", input: { command: "sleep 99" } }] }),
+      ].join("\n") + "\n",
+      "utf8"
+    );
+    const data = loadTranscript(tf);
+    const { messages: r1, report } = repairTranscript(tf, data.messages);
+    assert.strictEqual(report.filledUses, 1, "应识别 1 个孤儿 tool_use");
+    const last = r1[r1.length - 1];
+    assert.strictEqual(last.role, "user");
+    const fix = last.content.find((b) => b.type === "tool_result");
+    assert.ok(fix && fix.tool_use_id === "tu_x" && fix.is_error, "补齐占位 error tool_result");
+    // 幂等: 修复已落盘 → 再次 load+repair 无新修复
+    const again = repairTranscript(tf, loadTranscript(tf).messages);
+    assert.strictEqual(again.report.filledUses, 0, "二次修复应为空(幂等)");
+    fs.rmSync(dirD, { recursive: true, force: true });
+  });
+
+  await test("resume 崩溃修复: 坏行致孤儿 tool_result → 从内存树剔除", async () => {
+    const dirD = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-repair2-"));
+    const tf = path.join(dirD, "crash2.jsonl");
+    fs.writeFileSync(
+      tf,
+      [
+        JSON.stringify({ ts: "t1", role: "user", content: [{ type: "text", text: "跑一下" }] }),
+        "{bad json — assistant 行损坏被跳过",
+        // 其 tool_result 变成孤儿(引用不存在的 tool_use → 对 API 无效)
+        JSON.stringify({ ts: "t3", role: "user", content: [{ type: "tool_result", tool_use_id: "tu_gone", content: "out" }] }),
+      ].join("\n") + "\n",
+      "utf8"
+    );
+    const data = loadTranscript(tf);
+    const { messages: r1, report } = repairTranscript(tf, data.messages);
+    assert.strictEqual(report.droppedResults, 1, "应剔除 1 个孤儿 tool_result");
+    assert.ok(!r1.some((m) => m.content.some((b) => b.type === "tool_result")), "修复后树中无孤儿 tool_result");
+    fs.rmSync(dirD, { recursive: true, force: true });
+  });
+
+  // ---------- Part 8: API Key Keychain + 错误遥测 ----------
+  console.log("[8] API Key Keychain + 错误遥测");
+
+  await test("Keychain: 假 security 二进制 → store/load/delete + 解析顺序 env > Keychain", async () => {
+    const dirK = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-key-"));
+    const db = path.join(dirK, "db.txt");
+    const bin = path.join(dirK, "security");
+    // 假 security: add → 追加库文件; find → 打印 key 或退出 44(未找到); delete → 删库
+    fs.writeFileSync(
+      bin,
+      `#!/bin/sh
+case "$1" in
+  add-generic-password) printf '%s\\n' "$*" > "${db}"; exit 0 ;;
+  find-generic-password) if [ -f "${db}" ]; then sed -n 's/.*-w \\([^ ]*\\).*/\\1/p' "${db}"; exit 0; else exit 44; fi ;;
+  delete-generic-password) if [ -f "${db}" ]; then rm -f "${db}"; exit 0; else exit 44; fi ;;
+esac
+exit 1
+`,
+      "utf8"
+    );
+    fs.chmodSync(bin, 0o755);
+    const { keychainStore, keychainLoad, keychainDelete, resolveApiKey } = require("../dist/credentials/keychain");
+    const prevEnv = process.env.ANTHROPIC_API_KEY;
+    process.env.SECURITY_BIN = bin; // 测试注入假二进制(不触真实 Keychain)
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      assert.strictEqual(keychainLoad(), null, "初始无存储");
+      assert.strictEqual(resolveApiKey(), null, "env 与 Keychain 均无 → null");
+      keychainStore("sk-ant-test-123456");
+      assert.strictEqual(keychainLoad(), "sk-ant-test-123456", "store 后可 load");
+      assert.deepStrictEqual(resolveApiKey(), { apiKey: "sk-ant-test-123456", source: "keychain" });
+      process.env.ANTHROPIC_API_KEY = "sk-env-wins"; // env 优先
+      assert.deepStrictEqual(resolveApiKey(), { apiKey: "sk-env-wins", source: "env" });
+      process.env.ANTHROPIC_API_KEY = ""; // 空串视为未设置(web-smoke 依赖此语义)
+      assert.deepStrictEqual(resolveApiKey(), { apiKey: "sk-ant-test-123456", source: "keychain" });
+      assert.strictEqual(keychainDelete(), true, "删除成功");
+      assert.strictEqual(keychainLoad(), null);
+      assert.strictEqual(keychainDelete(), false, "再删 → 无存储 false");
+    } finally {
+      delete process.env.SECURITY_BIN;
+      if (prevEnv === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevEnv;
+      fs.rmSync(dirK, { recursive: true, force: true });
+    }
+  });
+
+  await test("遥测: classifyError 分类(budget/compact/provider/engine, 中断不计)", async () => {
+    const { classifyError } = require("../dist/telemetry/telemetry");
+    assert.strictEqual(classifyError(new RunAbortedError()), null, "用户中断不算故障");
+    assert.strictEqual(classifyError(new Error("token 预算熔断: 400 ≥ 250")), "budget");
+    assert.strictEqual(classifyError(new Error("runQuery: 超过最大轮次守卫(200 轮)")), "budget");
+    assert.strictEqual(classifyError(new Error("autocompact 熔断: 连续失败 3 次")), "compact");
+    assert.strictEqual(classifyError(new Error("blocking 水位: buffer 180000 ≥ 175000, 拒绝继续")), "compact");
+    assert.strictEqual(classifyError(new Error("HTTP 529: overloaded_error")), "provider");
+    assert.strictEqual(classifyError(new Error("fetch failed: ECONNRESET")), "provider");
+    assert.strictEqual(classifyError(new Error("别的什么错了")), "engine");
+  });
+
+  await test("遥测: recordError 分类落盘 JSONL + 会话级计数(中断不计)", async () => {
+    const dirT = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-telem-"));
+    const { Telemetry } = require("../dist/telemetry/telemetry");
+    const t = new Telemetry(dirT);
+    t.recordError("s1", new Error("token 预算熔断: 1 ≥ 1"));
+    assert.strictEqual(t.recordError("s1", new RunAbortedError()), null, "中断返回 null 不计入");
+    t.recordError("s2", new Error("HTTP 500"));
+    assert.strictEqual(t.errorStats.total, 2);
+    assert.strictEqual(t.errorStats.byCategory.budget, 1);
+    assert.strictEqual(t.errorStats.byCategory.provider, 1);
+    assert.strictEqual(t.sessionErrorCount("s1"), 1);
+    assert.strictEqual(t.sessionErrorCount("nope"), 0);
+    const lines = fs.readFileSync(t.logFile, "utf8").trim().split("\n").map(JSON.parse);
+    assert.strictEqual(lines.length, 2, "两行 JSONL");
+    assert.strictEqual(lines[0].category, "budget");
+    assert.strictEqual(lines[0].sessionId, "s1");
+    assert.ok(lines[0].ts && lines[0].message.includes("预算熔断"), JSON.stringify(lines[0]));
+    fs.rmSync(dirT, { recursive: true, force: true });
+  });
+
+  await test("遥测: 工具级失败计数(执行失败 + 未知工具; 权限拒绝不计)", async () => {
+    const dirT = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-telem2-"));
+    const { Telemetry } = require("../dist/telemetry/telemetry");
+    const telem = new Telemetry(dirT);
+    const provider = new MockProvider([
+      {
+        toolUses: [
+          { name: "Bash", input: { command: "ls /definitely-not-exist-xyz" } }, // 只读白名单放行 → 执行非零退出
+          { name: "NoSuchTool", input: {} },                                    // 未知工具
+          { name: "Edit", input: { path: "/tmp/x", old_string: "a", new_string: "b" } }, // 权限拒绝(正常工作流)
+        ],
+      },
+      { text: "done" },
+    ]);
+    const tools = new ToolRegistry();
+    tools.register(new BashTool());
+    tools.register(new EditTool()); // 注册后 Edit 走权限瀑布 → 用户拒绝(而非"未知工具")
+    const noHooks = new HookRunner(parseHookSettings({}), dirT, () => {});
+    const sessInfo = { sessionId: "s", transcriptPath: path.join(dirT, "t.jsonl"), cwd: dirT };
+    const deps = {
+      provider,
+      tools,
+      permissions: new PermissionEngine({
+        rules: { allow: [], deny: [], ask: [] },
+        hooks: noHooks,
+        provider,
+        mode: "default",
+        userResponder: async () => "no", // Edit → 用户拒绝
+        session: sessInfo,
+        log: () => {},
+      }),
+      hooks: noHooks,
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: ["test"],
+      systemTokens: 1,
+      model: "m",
+      artifactsDir: dirT,
+      session: sessInfo,
+      getUserMessages: () => [],
+      telemetry: telem,
+      log: () => {},
+    };
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    await runQuery(deps, state, "user");
+    assert.strictEqual(telem.errorStats.toolErrors, 2, "执行失败 + 未知工具计数");
+    assert.strictEqual(telem.errorStats.total, 0, "权限拒绝/无引擎级异常 → total 0");
+    fs.rmSync(dirT, { recursive: true, force: true });
+  });
+
   fs.rmSync(dir, { recursive: true, force: true });
   console.log(`\n冒烟测试全部通过 (${passed}/${passed})`);
 })().catch((e) => {
