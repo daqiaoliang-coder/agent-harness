@@ -49,6 +49,11 @@
     border-radius: 20px; padding: 2px 10px; font-size: 11px;
   }
   .badge b { color: var(--text); font-weight: 600; }
+  .badge select {
+    background: none; color: var(--text); border: 0; font: inherit; font-size: 11px;
+    outline: 0; cursor: pointer; padding: 0;
+  }
+  .badge select option { background: var(--bg2); }
   #conn { margin-left: auto; }
   #conn.on { color: var(--ok); } #conn.off { color: var(--err); }
   #stream { flex: 1; overflow-y: auto; padding: 20px 18px 8px; scroll-behavior: smooth; }
@@ -91,6 +96,7 @@
   .sysline.compact { color: var(--warn); }
   .sysline.error { color: var(--err); }
   .sysline.aborted { color: var(--warn); }
+  .sysline.cmd { color: var(--accent2); }
   .sysline.log { display: none; }
   body.show-log .sysline.log { display: block; }
   /* 权限弹窗 */
@@ -111,9 +117,21 @@
     border-radius: 8px; padding: 10px; max-height: 180px; overflow: auto; margin-bottom: 16px;
     white-space: pre-wrap; word-break: break-word;
   }
+  /* 权限弹窗 diff 预览(Edit/Write 时代替 JSON 入参) */
+  #perm-diff {
+    font-family: var(--mono); font-size: 12px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; max-height: 260px; overflow: auto; margin-bottom: 16px;
+    white-space: pre; word-break: break-word;
+  }
+  #perm-diff .dv-path { color: var(--accent2); margin-bottom: 6px; }
+  #perm-diff .dl { color: var(--err); }
+  #perm-diff .da { color: var(--ok); }
+  #perm-diff .dc { color: var(--dim); }
+  #perm-diff .dv-note { color: var(--warn); margin-top: 6px; }
   #perm-actions { display: flex; gap: 10px; justify-content: flex-end; }
   #perm-actions button { padding: 8px 18px; border-radius: 8px; border: 0; cursor: pointer; font-size: 13px; }
   #perm-yes { background: var(--ok); color: #fff; }
+  #perm-always { background: var(--bg3); color: var(--ok); border: 1px solid var(--ok) !important; }
   #perm-no { background: var(--bg3); color: var(--text); border: 1px solid var(--border) !important; }
   /* 输入区 */
   #inputbar { padding: 12px 18px 16px; background: var(--bg); }
@@ -151,14 +169,14 @@
   <main id="main">
     <div id="topbar">
       <span class="badge">model <b id="m-model">–</b></span>
-      <span class="badge">perm <b id="m-mode">–</b></span>
+      <span class="badge">perm <select id="m-mode" title="切换权限模式(双通道即时;bypassPermissions 须 /mode bypassPermissions --dangerous)"><option value="default">default</option><option value="auto">auto</option><option value="plan">plan</option></select></span>
       <span class="badge">session <b id="m-sess">–</b></span>
       <span id="conn" class="off">● connecting</span>
     </div>
     <div id="stream"><div id="stream-inner"></div></div>
     <div id="inputbar">
       <div id="inputwrap">
-        <textarea id="input" rows="1" placeholder="发送消息… (Enter 发送 / Shift+Enter 换行)"></textarea>
+        <textarea id="input" rows="1" placeholder="发送消息… (/ 命令如 /help /mode; Enter 发送 / Shift+Enter 换行)"></textarea>
         <button id="send" title="发送">➤</button>
         <button id="stop" title="中断当前任务">⏹</button>
       </div>
@@ -171,9 +189,11 @@
       <h2>⚠ 权限确认</h2>
       <div id="perm-tool"></div>
       <div id="perm-why"></div>
+      <div id="perm-diff"></div>
       <div id="perm-input"></div>
       <div id="perm-actions">
         <button id="perm-no">拒绝 (Esc)</button>
+        <button id="perm-always"></button>
         <button id="perm-yes">允许执行</button>
       </div>
     </div>
@@ -301,6 +321,32 @@ function sysLine(cls, text) {
   scrollBottom();
 }
 
+// ── 权限模式徽章(下拉切换)与 slash 命令渲染 ──
+// setModeBadge: 同步下拉选中值; 命令切出的模式(如 bypassPermissions)不在静态选项中 → 动态补项仅用于显示
+function setModeBadge(mode) {
+  const sel = $("m-mode");
+  if (![...sel.options].some((o) => o.value === mode)) {
+    const o = document.createElement("option");
+    o.value = mode; o.textContent = mode;
+    sel.appendChild(o);
+  }
+  sel.value = mode;
+}
+// 下拉切换 → POST /api/mode(bypassPermissions 不在 UI 暴露); 成功后 mode_changed 事件回驱徽章(多标签页一致)
+$("m-mode").onchange = async () => {
+  const mode = $("m-mode").value;
+  try {
+    const r = await api("/api/mode", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, sessionId: activeSess }),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      sysLine("error", `✖ 模式切换失败: ${d.error || r.status}`);
+    }
+  } catch (e) { sysLine("error", `✖ 模式切换失败: ${e.message}`); }
+};
+
 // ── 权限弹窗(队列: 同刻可能有多个挂起请求, 逐个展示) ──
 const permQueue = [];
 let permShowing = null;
@@ -313,7 +359,30 @@ function nextPerm() {
   if (!permShowing) { $("perm-overlay").classList.remove("show"); return; }
   $("perm-tool").textContent = `工具: ${permShowing.toolName}`;
   $("perm-why").textContent = `原因: ${permShowing.reason}`;
-  $("perm-input").textContent = JSON.stringify(permShowing.input, null, 2);
+  // Edit/Write: 渲染 diff 预览(人类可读); 无预览回落 JSON 入参
+  const diff = $("perm-diff"), inputEl = $("perm-input");
+  diff.textContent = ""; diff.style.display = "none"; inputEl.style.display = "block";
+  if (permShowing.preview) {
+    diff.style.display = "block"; inputEl.style.display = "none";
+    diff.appendChild(el("div", "dv-path",
+      permShowing.preview.path + (permShowing.preview.type === "write-new" ? "(新文件)" : "")));
+    for (const l of permShowing.preview.lines) {
+      diff.appendChild(el("div",
+        l.op === "del" ? "dl" : l.op === "add" ? "da" : "dc",
+        (l.op === "del" ? "- " : l.op === "add" ? "+ " : "  ") + l.text));
+    }
+    if (permShowing.preview.note) diff.appendChild(el("div", "dv-note", "… " + permShowing.preview.note));
+  } else {
+    inputEl.textContent = JSON.stringify(permShowing.input, null, 2);
+  }
+  // "总是允许"按钮: 服务端注明 alwaysRule 时才提供(静态/Hook ask 路径不提供)
+  const alwaysBtn = $("perm-always");
+  if (permShowing.alwaysRule) {
+    alwaysBtn.style.display = "";
+    alwaysBtn.textContent = `总是允许 ${permShowing.alwaysRule}(本会话)`;
+  } else {
+    alwaysBtn.style.display = "none";
+  }
   $("perm-overlay").classList.add("show");
 }
 async function answerPerm(answer) {
@@ -329,6 +398,7 @@ async function answerPerm(answer) {
 }
 $("perm-yes").onclick = () => answerPerm("yes");
 $("perm-no").onclick = () => answerPerm("no");
+$("perm-always").onclick = () => answerPerm("always");
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && permShowing) answerPerm("no");
 });
@@ -372,7 +442,7 @@ async function activateSession(id) {
     if (!r.ok) { sysLine("error", "✖ 会话历史加载失败"); return; }
     const d = await r.json();
     $("m-model").textContent = d.model;
-    $("m-mode").textContent = d.mode;
+    setModeBadge(d.mode); // 实时模式(运行中 /mode 切换后切换视图正确回显)
     d.events.forEach(handleEvent); // 回放该会话消息树
     (d.pendingPerms ?? []).forEach(showPerm); // 该会话挂起的权限弹窗补放
     setRunning(!!d.running); // 切到运行中的会话 → 停止按钮正确恢复
@@ -399,7 +469,7 @@ function handleEvent(ev) {
   switch (ev.kind) {
     case "ready":
       $("m-model").textContent = ev.model;
-      $("m-mode").textContent = ev.mode;
+      setModeBadge(ev.mode);
       $("m-sess").textContent = ev.sessionId.replace(/^sess_/, "");
       activeSess = ev.sessionId;
       refreshSessions();
@@ -417,6 +487,8 @@ function handleEvent(ev) {
     case "tool_start": toolStart(ev); break;
     case "tool_result": toolResult(ev); break;
     case "perm": permDecision(ev); break;
+    case "command_output": sysLine("cmd", ev.text); break;   // slash 命令输出(/help /mode /status …)
+    case "mode_changed": setModeBadge(ev.mode); break;      // 运行中模式切换 → 徽章同步(多标签页一致)
     case "compact": sysLine("compact", `⇣ [${ev.level}] ${ev.detail}`); break;
     case "log": sysLine("log", ev.text); break;
     case "error": sysLine("error", `✖ ${ev.text}`); setRunning(false); break;

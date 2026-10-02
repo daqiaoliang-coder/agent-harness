@@ -32,12 +32,17 @@ export class EditTool implements Tool {
 
   private async run(input: Record<string, unknown>): Promise<ToolResult> {
     const p = String(input.path ?? "");
-    const oldStr = String(input.old_string ?? "");
-    const newStr = String(input.new_string ?? "");
+    // 直调防线: old_string/new_string 必须为 string — new_string 缺失曾被 String() 转空串,
+    // old_string 非空时静默删除匹配内容; 显式 new_string: "" 仍合法(删除语义)
+    if (!p || typeof input.old_string !== "string" || typeof input.new_string !== "string") {
+      return { content: "参数错误: 需要 path / old_string / new_string", isError: true };
+    }
+    const oldStr = input.old_string;
+    const newStr = input.new_string;
     const replaceAll = input.replace_all === true;
 
-    if (!p || !oldStr) {
-      return { content: "参数错误: 需要 path / old_string / new_string", isError: true };
+    if (!oldStr) {
+      return { content: "参数错误: old_string 不能为空(需非空匹配串)", isError: true };
     }
     if (oldStr === newStr) {
       return { content: "old_string 与 new_string 相同, 无需编辑", isError: true };

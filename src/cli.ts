@@ -5,13 +5,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as readline from "readline";
-import { Message, RunAbortedError } from "./types";
+import { ContentBlock, Message, RunAbortedError } from "./types";
 import { estimateTokens } from "./context/tokenEstimator";
 import { LLMProvider, MockProvider, ScriptedTurn } from "./llm/provider";
 import { AnthropicProvider } from "./llm/anthropicProvider";
 import { HookRunner } from "./hooks/runner";
-import { parseHookSettings, HookSettings } from "./hooks/events";
-import { PermissionEngine, PermissionMode, PermissionAsk } from "./permissions/engine";
+import { HookSettings } from "./hooks/events";
+import { PermissionEngine, PermissionMode, PermissionAsk, PermissionAnswer } from "./permissions/engine";
 import { PermissionRules } from "./permissions/rules";
 import { ToolRegistry } from "./tools/tool";
 import { BashTool } from "./tools/bash";
@@ -33,8 +33,16 @@ import {
 } from "./compact/watermarks";
 import { initLoopState, runQuery, QueryDeps, LoopState } from "./query";
 import { UiEvent } from "./events";
+import { dispatchSlashCommand, CommandContext, PERMISSION_MODES, PLAN_MODE_SUFFIX } from "./commands";
 import { resolveApiKey, keychainStore, keychainLoad, keychainDelete } from "./credentials/keychain";
 import { getTelemetry } from "./telemetry/telemetry";
+import {
+  loadMergedSettings,
+  MergedSettings,
+  composeSystemPrompt,
+  resolveModel,
+  resolveLayerPaths,
+} from "./settings/loader";
 
 const PROJECT_ROOT = process.cwd();
 const ARTIFACTS_DIR = path.join(PROJECT_ROOT, ".agent-harness", "artifacts");
@@ -66,38 +74,11 @@ function log(line: string): void {
   console.log(line);
 }
 
-interface LoadedSettings {
-  rules: PermissionRules;
-  hookSettings: HookSettings;
-  mcpServers: Record<string, McpServerConfig>;
-  engine: { maxTurns?: number; tokenBudget?: number };
-}
-
-const SETTINGS_PATH = path.join(PROJECT_ROOT, "demo", "settings.json");
-
-function loadSettings(): LoadedSettings {
-  if (!fs.existsSync(SETTINGS_PATH)) {
-    throw new Error(`未找到 ${SETTINGS_PATH} — 请在仓库根目录运行`);
-  }
-  const settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8")) as {
-    permissions?: { allow?: string[]; deny?: string[]; ask?: string[] };
-    hooks?: unknown;
-    mcpServers?: Record<string, McpServerConfig>;
-    engine?: { maxTurns?: number; tokenBudget?: number };
-  };
-  return {
-    rules: {
-      allow: settings.permissions?.allow ?? [],
-      deny: settings.permissions?.deny ?? [],
-      ask: settings.permissions?.ask ?? [],
-    },
-    hookSettings: parseHookSettings(settings.hooks),
-    mcpServers: settings.mcpServers ?? {},
-    engine: {
-      maxTurns: settings.engine?.maxTurns,
-      tokenBudget: settings.engine?.tokenBudget,
-    },
-  };
+// settings 分层合并薄包装: 用户级(~/.agent-harness, env AGENT_HARNESS_HOME 可重定向) → 项目级
+// (demo/settings.json, 既有约定零迁移) → 本地级(.agent-harness/settings.json, gitignored)。
+// 返回形态为旧接口的超集(+model/systemPromptAppend/layers 诊断); server.ts 经 re-export 复用。
+function loadSettings(logFn?: (line: string) => void): MergedSettings {
+  return loadMergedSettings({ projectRoot: PROJECT_ROOT, log: logFn ?? log });
 }
 
 export interface Session {
@@ -105,6 +86,8 @@ export interface Session {
   state: LoopState;
   transcriptPath: string;
   send: (text: string) => Promise<void>;
+  // 运行中切换权限模式(双通道即时): 权限引擎 + 系统提示(plan 后缀动态增删)+ mode_changed 事件
+  setMode: (mode: PermissionMode) => void;
   // 中断当前运行中的 send(Ctrl-C / Web 停止按钮): LLM 请求/工具执行/压缩侧查询同轮中止,
   // 消息树一致性由引擎保证; 无运行中的 send 时为 no-op
   abort: () => void;
@@ -115,6 +98,7 @@ export interface Session {
 export async function createSession(opts: {
   provider: LLMProvider;
   cfg: CompactConfig;
+  // 系统提示"前缀"(内置基线 + settings 追加段 + CLI 追加); plan 模式后缀由本函数按 mode 追加
   systemPrompt: string;
   rules: PermissionRules;
   hookSettings: HookSettings;
@@ -132,7 +116,7 @@ export async function createSession(opts: {
   // 日志通道(可选; 默认 console; web 模式接 EventBus 转发)
   logFn?: (line: string) => void;
   // 权限弹窗应答器: demo 传脚本化拒绝, chat 传真实 readline 交互, web 桥接浏览器
-  userResponder: (req: PermissionAsk) => Promise<"yes" | "no">;
+  userResponder: (req: PermissionAsk) => Promise<PermissionAnswer>;
 }): Promise<Session> {
   const logS = opts.logFn ?? log; // 会话内日志通道(console 默认; web 模式转发到事件流)
   fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
@@ -183,14 +167,21 @@ export async function createSession(opts: {
   const userPrompts: string[] = [];
   // 错误遥测: 工具失败计数(query.ts) + 引擎级异常落盘(send catch); 进程级共享实例
   const telemetry = getTelemetry(PROJECT_ROOT);
+  // 系统提示组装: 前缀(opts.systemPrompt)+ plan 后缀按当前模式动态增删(单一事实来源 = 当前模式);
+  // setMode 切换时重组 → deps.systemPrompt 每轮主循环直读, 下一轮即生效
+  const composeWithSuffix = (mode: PermissionMode): string =>
+    [opts.systemPrompt, mode === "plan" ? PLAN_MODE_SUFFIX : undefined]
+      .filter((s): s is string => !!s)
+      .join("\n\n");
+  const initialPrompt = composeWithSuffix(opts.mode);
   const deps: QueryDeps = {
     provider: opts.provider,
     tools,
     permissions,
     hooks,
     cfg: opts.cfg,
-    systemPrompt: [opts.systemPrompt],
-    systemTokens: estimateTokens(opts.systemPrompt),
+    systemPrompt: [initialPrompt],
+    systemTokens: estimateTokens(initialPrompt),
     model: "agent-harness",
     artifactsDir: ARTIFACTS_DIR,
     session,
@@ -253,33 +244,57 @@ export async function createSession(opts: {
   };
   const abort = () => currentAbort?.abort();
 
-  // 设置热加载(参考原版架构 settings 变更实时生效): fs.watch + 300ms 防抖 → 规则与 Hook 原地替换
+  // 运行中权限模式切换(双通道即时): ① 权限引擎纯替换 ② 系统提示重组(plan 后缀动态增删;
+  // systemTokens 同步重算供水位检查)。代价: 真实 provider 的 prompt cache 前缀失效一次(一次性, 对标原版 /model)
+  const setMode = (mode: PermissionMode): void => {
+    permissions.updateMode(mode);
+    const next = composeWithSuffix(mode);
+    deps.systemPrompt = [next];
+    deps.systemTokens = estimateTokens(next);
+    const line = `[mode] 权限模式已切换: ${mode}${mode === "plan" ? "(只读探索, 副作用操作将被拒绝)" : ""}`;
+    logS(line);
+    // Web 可见反馈: log 事件默认折叠 → 另发 command_output; CLI 不传 emit → console 一份不重复
+    opts.emit?.({ kind: "command_output", text: line });
+    opts.emit?.({ kind: "mode_changed", mode });
+  };
+
+  // 设置热加载(参考原版架构 settings 变更实时生效): watch 全部已加载层 + 300ms 防抖 → 重新分层合并,
+  // 规则与 Hook 原地替换(systemPrompt/model/engine 不热加载 — CLI 长会话下一会话生效, web 端每会话重读)
   let watchTimer: NodeJS.Timeout | null = null;
-  const watcher = fs.watch(SETTINGS_PATH, () => {
+  const onLayerChange = (): void => {
     if (watchTimer) return;
     watchTimer = setTimeout(() => {
       watchTimer = null;
       try {
-        const fresh = loadSettings();
+        const fresh = loadSettings(logS);
         permissions.updateRules(fresh.rules);
         hooks.updateSettings(fresh.hookSettings);
-        logS("[settings] 检测到 settings.json 变更 → 权限规则与 Hook 已热加载");
+        logS("[settings] 检测到分层配置变更 → 已重新合并, 权限规则与 Hook 热加载");
       } catch (e) {
         logS(`[settings] 热加载失败(沿用旧配置): ${(e as Error).message}`);
       }
     }, 300);
-  });
-  watcher.on("error", () => {}); // 监听失败静默(热加载为增强能力, 不阻断会话)
+  };
+  const watchers: fs.FSWatcher[] = [];
+  for (const layerPath of resolveLayerPaths({ projectRoot: PROJECT_ROOT })) {
+    if (!fs.existsSync(layerPath)) continue; // 会话启动后才创建的文件不监听(增强能力, 不求完备)
+    try {
+      const w = fs.watch(layerPath, onLayerChange);
+      w.on("error", () => {}); // 监听失败静默(热加载为增强能力, 不阻断会话)
+      watchers.push(w);
+    } catch { /* 平台限制等 → 跳过该层监听 */ }
+  }
 
   return {
     deps,
     state,
     transcriptPath,
     send,
+    setMode,
     abort,
     close: () => {
       if (watchTimer) clearTimeout(watchTimer);
-      watcher.close();
+      watchers.forEach((w) => w.close());
       mcp.stop();
     },
   };
@@ -323,7 +338,8 @@ function buildScript(): ScriptedTurn[] {
 }
 
 async function runDemo(): Promise<void> {
-  const { rules, hookSettings, mcpServers, engine } = loadSettings();
+  const merged = loadSettings();
+  const { rules, hookSettings, mcpServers, engine } = merged;
   const cfg = DEMO_COMPACT_CONFIG;
   const wm = computeWatermarks(cfg);
   const provider = new MockProvider(buildScript());
@@ -340,7 +356,8 @@ async function runDemo(): Promise<void> {
   const session = await createSession({
     provider,
     cfg,
-    systemPrompt: DEMO_SYSTEM_PROMPT,
+    // 内置 demo 基线 + settings 各层追加段(append-only; Mock 忽略内容, 计量含追加 token)
+    systemPrompt: composeSystemPrompt(DEMO_SYSTEM_PROMPT, merged),
     rules,
     hookSettings,
     mcpServers,
@@ -370,19 +387,23 @@ async function runDemo(): Promise<void> {
   session.close();
 }
 
-async function runChat(): Promise<void> {
-  // key 解析: env ANTHROPIC_API_KEY > macOS Keychain(node dist/cli.js key set)
-  const resolved = resolveApiKey();
-  if (!resolved) {
-    throw new Error(
-      "chat 模式需要 API key: 推荐 `node dist/cli.js key set` 存入 macOS Keychain(避免明文 .env), " +
-      "或 export ANTHROPIC_API_KEY=…。可选: ANTHROPIC_MODEL(默认 claude-sonnet-4-5), ANTHROPIC_BASE_URL(网关)。" +
-      "demo 模式无需 key: npm run demo"
-    );
-  }
-  // 参数: node dist/cli.js chat [--resume [sessionId]] [--plan]  (--resume 无 id → 取最近的会话)
-  const args = process.argv.slice(3);
+// chat/headless 共享 flags 解析: --plan / --append-system-prompt / --resume [sessionId]
+// (headless 的日志走 stderr 保持 stdout 纯净 → logFn 参数化)
+function parseChatFlags(
+  args: string[],
+  logFn: (line: string) => void = log
+): { planMode: boolean; cliAppend?: string; resumeSessionId: string | null } {
   const planMode = args.includes("--plan");
+  // --append-system-prompt: CLI 级系统提示追加(排在 settings 追加段之后, 模式后缀之前)
+  const appendIdx = args.indexOf("--append-system-prompt");
+  let cliAppend: string | undefined;
+  if (appendIdx !== -1) {
+    const v = args[appendIdx + 1];
+    if (!v || v.startsWith("--")) {
+      throw new Error('用法: chat --append-system-prompt "追加的系统提示内容"');
+    }
+    cliAppend = v;
+  }
   const resumeIdx = args.indexOf("--resume");
   let resumeSessionId: string | null = null;
   if (resumeIdx !== -1) {
@@ -399,17 +420,41 @@ async function runChat(): Promise<void> {
         throw new Error(`--resume: ${SESSIONS_DIR} 下没有可恢复的 sess_chat_* 会话`);
       }
       resumeSessionId = sessions[0].f.replace(/\.jsonl$/, "");
-      log(`[resume] 最近会话: ${sessions[0].f}(${new Date(sessions[0].mtime).toLocaleString()})`);
-      if (sessions.length > 1) log(`[resume] 其余候选: ${sessions.slice(1, 4).map((s) => s.f).join(", ")}`);
+      logFn(`[resume] 最近会话: ${sessions[0].f}(${new Date(sessions[0].mtime).toLocaleString()})`);
+      if (sessions.length > 1) logFn(`[resume] 其余候选: ${sessions.slice(1, 4).map((s) => s.f).join(", ")}`);
     }
   }
+  return { planMode, cliAppend, resumeSessionId };
+}
 
-  const model = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
+async function runChat(): Promise<void> {
+  // headless 分流(对标 claude -p): -p/--print 或 stdin 为管道 → 非交互单发(见 runHeadless)
+  const args = process.argv.slice(3);
+  const pPos = args.indexOf("-p") !== -1 ? args.indexOf("-p") : args.indexOf("--print");
+  if (pPos !== -1 || !process.stdin.isTTY) {
+    return runHeadless(args);
+  }
+  // key 解析: env ANTHROPIC_API_KEY > macOS Keychain(node dist/cli.js key set)
+  const resolved = resolveApiKey();
+  if (!resolved) {
+    throw new Error(
+      "chat 模式需要 API key: 推荐 `node dist/cli.js key set` 存入 macOS Keychain(避免明文 .env), " +
+      "或 export ANTHROPIC_API_KEY=…。可选: ANTHROPIC_MODEL(默认 claude-sonnet-4-5), ANTHROPIC_BASE_URL(网关)。" +
+      "demo 模式无需 key: npm run demo"
+    );
+  }
+  // 参数: node dist/cli.js chat [--resume [sessionId]] [--plan] [--append-system-prompt "…"]
+  //        (--resume 无 id → 取最近的会话)
+  const { planMode, cliAppend, resumeSessionId } = parseChatFlags(args);
+
+  // model 解析序: env ANTHROPIC_MODEL > settings 分层合并(本地>项目>用户) > 内置默认
+  const merged = loadSettings();
+  const { rules, hookSettings, mcpServers, engine } = merged;
+  const model = resolveModel(merged);
   const provider = new AnthropicProvider({ apiKey: resolved.apiKey, model, log });
   // 生产水位: 200K 窗口/32K 输出。chars/4 估算对 CJK 偏低 → 真实超限时由 413→T5 reactive compact 兜底
   const cfg = PRODUCTION_COMPACT_CONFIG;
   const wm = computeWatermarks(cfg);
-  const { rules, hookSettings, mcpServers, engine } = loadSettings();
   const chatSessionId = resumeSessionId ?? `sess_chat_${Date.now()}`;
 
   log("═══ agent-harness chat(真实 LLM) ═══");
@@ -419,15 +464,15 @@ async function runChat(): Promise<void> {
   } else {
     log("[config] 权限模式 auto: 未命中规则的 Bash 走两阶段分类器; Edit/Write/Read 由规则放行");
   }
-  log("[config] Hook 与规则沿用 demo/settings.json; /exit 退出; 恢复上次会话: chat --resume [sessionId]\n");
+  log("[config] 配置分层: 用户级(~/.agent-harness) → 项目级(demo/settings.json) → 本地级(.agent-harness/); 系统提示可经 systemPromptAppend 追加; /help 查看命令, /mode 运行中切换权限模式; 恢复上次会话: chat --resume [sessionId]\n");
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: "❯ " });
   const session = await createSession({
     provider,
     cfg,
-    systemPrompt: planMode
-      ? CHAT_SYSTEM_PROMPT + "\n当前处于 Plan 模式: 只读探索与规划, 不要尝试修改文件或执行副作用命令; 结束时给出实施计划。"
-      : CHAT_SYSTEM_PROMPT,
+    // 系统提示组装(前缀): 内置基线 → settings 追加段(user→project→local) → --append-system-prompt;
+    // plan 模式后缀由 createSession 按 mode 内部追加 → setMode 运行中动态增删(单一事实来源 = 当前模式)
+    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged, { cliAppend }),
     rules,
     hookSettings,
     mcpServers,
@@ -439,15 +484,31 @@ async function runChat(): Promise<void> {
     // 真实权限弹窗: 交互式确认(瀑布兜底层); 中断时以空行收尾挂起的 question(防吞下一行输入)
     userResponder: (req) =>
       new Promise((resolve) => {
-        const finish = (ans: string) => resolve(ans.trim().toLowerCase().startsWith("y") ? "yes" : "no");
+        const finish = (ans: string) => {
+          const t = ans.trim().toLowerCase();
+          if (t.startsWith("a") && req.alwaysRule) resolve("always");
+          else resolve(t.startsWith("y") ? "yes" : "no");
+        };
         const onAbort = () => rl.write("\n");
         if (req.signal?.aborted) {
           finish("");
           return;
         }
         req.signal?.addEventListener("abort", onAbort, { once: true });
+        // Edit/Write: 渲染 diff 预览(人类可读)代替原始 JSON blob; 其他工具保持 JSON 单行
+        const head = req.preview
+          ? `\n[权限确认] ${req.toolName} → ${req.preview.path}: ${req.why}`
+          : `\n[权限确认] ${req.toolName}(${JSON.stringify(req.toolInput).slice(0, 200)}): ${req.why}`;
+        const body = req.preview
+          ? req.preview.lines
+              .map((l) => `  ${l.op === "del" ? "-" : l.op === "add" ? "+" : " "} ${l.text}`)
+              .join("\n") + (req.preview.note ? `\n  … ${req.preview.note}` : "")
+          : "";
+        const hint = req.alwaysRule
+          ? `允许? [y=允许 a=总是允许本会话(${req.alwaysRule}) / 回车=拒绝] `
+          : `允许执行? (y/N) `;
         rl.question(
-          `\n[权限确认] ${req.toolName}(${JSON.stringify(req.toolInput).slice(0, 200)}): ${req.why}\n允许执行? (y/N) `,
+          `${head}\n${body ? body + "\n" : ""}${hint}`,
           (ans) => {
             req.signal?.removeEventListener("abort", onAbort);
             finish(ans);
@@ -455,6 +516,27 @@ async function runChat(): Promise<void> {
         );
       }),
   });
+
+  // ── Slash 命令上下文: 命令输出走 console; /exit 经 rl.close(触发退出摘要) ──
+  const commandCtx: CommandContext = {
+    getMode: () => session.deps.permissions.mode,
+    setMode: (m) => session.setMode(m),
+    status: () =>
+      `[status] 会话 ${chatSessionId} | 权限模式 ${session.deps.permissions.mode}\n` +
+      `[status] 轮次 ${session.state.turnCount} | 累计计费 tokens ${session.state.totalTokensUsed} | ` +
+        `错误 ${getTelemetry(PROJECT_ROOT).sessionErrorCount(chatSessionId)} 次\n` +
+      `[status] transcript: ${session.transcriptPath}`,
+    permissionsSummary: () => {
+      const p = session.deps.permissions;
+      const c = p.ruleCounts;
+      return (
+        `[permissions] 分层合并后规则: allow ${c.allow} | deny ${c.deny} | ask ${c.ask}\n` +
+        `[permissions] 会话内"总是允许"记忆 ${p.sessionAllowCount} 条(仅本会话)`
+      );
+    },
+    log: (line) => log(line),
+    exit: () => rl.close(),
+  };
 
   // ── Ctrl-C: 运行中 → 优雅中断当前轮(再次 Ctrl-C 强制退出); 空闲 → 退出 ──
   let busy = false;
@@ -482,8 +564,10 @@ async function runChat(): Promise<void> {
       rl.prompt();
       return;
     }
-    if (text === "/exit" || text === "exit") {
-      rl.close();
+    // slash 命令域(含 /exit)统一走注册表; 保留裸 exit 兼容旧习惯。
+    // 命令不 send → 不入消息树不入 transcript; /exit 关闭后 prompt() 为 no-op(readline 内部 closed 检查)
+    if (text === "exit" || dispatchSlashCommand(text, commandCtx)) {
+      rl.prompt();
       return;
     }
     busy = true;
@@ -510,6 +594,184 @@ async function runChat(): Promise<void> {
     process.exit(0);
   });
   await new Promise(() => {}); // readline 自持事件循环
+}
+
+// ── Headless: 非交互单发(对标 claude -p) ──
+//   node dist/cli.js chat -p "查询" [--output-format text|json|stream-json]
+//                        [--permission-mode default|auto|plan|bypassPermissions(--dangerous)]
+//   cat x | chat -p "总结"  → stdin 为附加上下文;  cat x | chat → stdin 即提示词
+// 语义: stdout 纯净(进度/日志全走 stderr, 可安全管道); 权限瀑布照常(deny/静态/Hook/allow/分类器),
+//       落到人工确认层自动拒绝并计数(引擎生成 error tool_result, 模型收到拒绝反馈可换路);
+//       exit 0=运行完成(权限拒绝/工具错误属业务结果) / 1=系统故障(key 缺失/参数非法/预算熔断/无最终文本)
+//       / 130=运行中二次 Ctrl-C 强退。
+// provider: AGENT_HARNESS_MOCK_SCRIPT(ScriptedTurn[] JSON, 显式测试通道)优先于 key — 防生产脚本静默 mock。
+// 会话: sessionId 沿用 sess_chat_* → headless 会话可被交互 chat --resume 列出续接(双向互通)。
+async function runHeadless(args: string[]): Promise<void> {
+  const errLog = (line: string) => process.stderr.write(line + "\n");
+
+  let outputFormat: "text" | "json" | "stream-json" = "text";
+  const ofIdx = args.indexOf("--output-format");
+  if (ofIdx !== -1) {
+    const v = args[ofIdx + 1];
+    if (v !== "text" && v !== "json" && v !== "stream-json") {
+      throw new Error(`--output-format 非法: ${v ?? "(缺值)"} — 可选: text|json|stream-json`);
+    }
+    outputFormat = v;
+  }
+  const pPos = args.indexOf("-p") !== -1 ? args.indexOf("-p") : args.indexOf("--print");
+  let query: string | undefined;
+  if (pPos !== -1) {
+    const v = args[pPos + 1];
+    if (!v || v.startsWith("--")) {
+      throw new Error('用法: chat -p "查询内容"(或经 stdin 管道输入)');
+    }
+    query = v;
+  }
+  // headless 无法 /mode 运行中切换 → 启动 flag 指定模式(默认 auto 对齐交互 chat; --plan 为 plan 简写)
+  const pmIdx = args.indexOf("--permission-mode");
+  let permissionMode: PermissionMode | undefined;
+  if (pmIdx !== -1) {
+    const v = args[pmIdx + 1] as PermissionMode;
+    if (!PERMISSION_MODES.includes(v)) {
+      throw new Error(`--permission-mode 非法: ${args[pmIdx + 1] ?? "(缺值)"} — 可选: ${PERMISSION_MODES.join("|")}`);
+    }
+    if (v === "bypassPermissions" && !args.includes("--dangerous")) {
+      throw new Error("--permission-mode bypassPermissions 将跳过全部权限确认(高风险): 须追加 --dangerous");
+    }
+    permissionMode = v;
+  }
+
+  // stdin 非 TTY(管道/重定向)→ 全量读入: 有 -p 时作附加上下文, 无 -p 时即提示词
+  let stdinText: string | undefined;
+  if (!process.stdin.isTTY) {
+    stdinText = await new Promise<string>((resolve, reject) => {
+      let buf = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (c) => {
+        buf += c.toString();
+      });
+      process.stdin.on("end", () => resolve(buf));
+      process.stdin.on("error", reject);
+    });
+  }
+  let prompt: string;
+  if (query !== undefined) {
+    prompt = stdinText && stdinText.length > 0 ? `${query}\n\n--- stdin 附加内容 ---\n${stdinText}` : query;
+  } else if (stdinText && stdinText.trim().length > 0) {
+    prompt = stdinText;
+  } else {
+    throw new Error('headless 需要输入: chat -p "查询内容" 或经 stdin 管道提供');
+  }
+
+  // 共享 flags + 组装(与交互 chat 同源: 分层 settings / 模型解析 / 生产水位)
+  const flags = parseChatFlags(args, errLog);
+  const mode: PermissionMode = permissionMode ?? (flags.planMode ? "plan" : "auto");
+  const merged = loadSettings();
+  const { rules, hookSettings, mcpServers, engine } = merged;
+  let provider: LLMProvider;
+  let model: string;
+  const mockScript = process.env.AGENT_HARNESS_MOCK_SCRIPT;
+  if (mockScript !== undefined) {
+    try {
+      provider = new MockProvider(JSON.parse(mockScript) as ScriptedTurn[]);
+    } catch (e) {
+      throw new Error(`AGENT_HARNESS_MOCK_SCRIPT 解析失败(须为 ScriptedTurn[] JSON): ${(e as Error).message}`);
+    }
+    model = "mock";
+  } else {
+    const resolved = resolveApiKey();
+    if (!resolved) {
+      throw new Error(
+        "headless 需要 API key: export ANTHROPIC_API_KEY=… 或 `node dist/cli.js key set` 存入 Keychain; " +
+        "测试通道: AGENT_HARNESS_MOCK_SCRIPT='<ScriptedTurn[] JSON>'"
+      );
+    }
+    model = resolveModel(merged);
+    provider = new AnthropicProvider({ apiKey: resolved.apiKey, model, log: errLog });
+  }
+  const sessionId = flags.resumeSessionId ?? `sess_chat_${Date.now()}`;
+
+  let permissionDenials = 0;
+  const session = await createSession({
+    provider,
+    cfg: PRODUCTION_COMPACT_CONFIG,
+    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged, { cliAppend: flags.cliAppend }),
+    rules,
+    hookSettings,
+    mcpServers,
+    engine,
+    sessionId,
+    mode,
+    resume: flags.resumeSessionId !== null,
+    // stream-json: UiEvent + 流式增量逐行 JSONL; text/json: 不向 stdout 渐进渲染(保持纯净可管道)
+    renderDelta:
+      outputFormat === "stream-json"
+        ? (t) => process.stdout.write(JSON.stringify({ kind: "assistant_delta", text: t }) + "\n")
+        : undefined,
+    emit: outputFormat === "stream-json" ? (e) => process.stdout.write(JSON.stringify(e) + "\n") : undefined,
+    logFn: errLog,
+    // 无人值守: 瀑布走到人工确认层 → 自动拒绝; 中断收尾保护与交互 chat 同款
+    userResponder: async (req) => {
+      if (req.signal?.aborted) return "no";
+      permissionDenials++;
+      errLog(`[headless] 权限弹窗自动拒绝: ${req.toolName}(${JSON.stringify(req.toolInput).slice(0, 120)})`);
+      return "no";
+    },
+  });
+
+  // SIGINT: 第一次 = 优雅中断当前轮(已生成部分照常输出, interrupted 标记); 第二次 = 强退 130
+  let interrupted = false;
+  const onInt = (): void => {
+    if (interrupted) {
+      errLog("⏹ 强制退出");
+      process.exit(130);
+    }
+    interrupted = true;
+    errLog("⏹ 中断当前任务…(再次 Ctrl-C 强制退出)");
+    session.abort();
+  };
+  process.on("SIGINT", onInt);
+
+  const state = session.state;
+  try {
+    await session.send(prompt);
+  } finally {
+    session.close();
+    process.removeListener("SIGINT", onInt);
+  }
+
+  // 最终文本: 消息树自尾向前取最近一条含 text 块的 assistant 消息
+  let result = "";
+  for (let i = state.messages.length - 1; i >= 0 && !result; i--) {
+    const m = state.messages[i];
+    if (m.role !== "assistant") continue;
+    result = m.content
+      .filter((b): b is Extract<ContentBlock, { type: "text" }> => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+  }
+  if (!result && !interrupted) {
+    throw new Error("headless 运行完成但无最终文本(模型仅工具调用即停)— 视为系统故障");
+  }
+  const stats = {
+    result,
+    sessionId,
+    mode,
+    turns: state.turnCount,
+    totalTokensUsed: state.totalTokensUsed,
+    toolUses: state.messages.reduce((n, m) => n + m.content.filter((b) => b.type === "tool_use").length, 0),
+    permissionDenials,
+    errors: getTelemetry(PROJECT_ROOT).sessionErrorCount(sessionId),
+    interrupted,
+  };
+  if (outputFormat === "json") {
+    process.stdout.write(JSON.stringify(stats) + "\n");
+  } else if (outputFormat === "stream-json") {
+    process.stdout.write(JSON.stringify({ kind: "result", ...stats }) + "\n");
+  } else if (result) {
+    process.stdout.write(result + "\n");
+  }
+  process.exit(0);
 }
 
 // ── key 子命令: API key 存取 macOS Keychain(避免明文 .env/shell export) ──

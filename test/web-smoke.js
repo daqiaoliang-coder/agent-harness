@@ -4,11 +4,16 @@
 //       SSE 重连补放挂起弹窗 / stop 收尾 / 会话列表 / 新建会话 /
 //       中断 e2e(权限等待中 POST /api/abort → 弹窗拒绝 + aborted + transcript 树一致 + 会话可继续) /
 //       多会话并发(A 挂起弹窗不阻塞 B; 事件带 sessionId 标记; abort 按会话隔离) /
-//       会话历史端点 / 活动会话重复 resume 不重置 / 遥测汇总(GET /api/stats)
+//       会话历史端点 / 活动会话重复 resume 不重置 / 遥测汇总(GET /api/stats) /
+//       会话级"总是允许" e2e(弹窗 alwaysRule → always 应答 → 同会话免弹窗 / 新会话不继承) /
+//       工具输入校验 e2e(坏输入不弹窗直接 error tool_result) /
+//       分层配置 e2e(独立 spawn + 用户级 allow 规则跨层生效, date 免弹窗) /
+//       slash 命令 + 模式运行中切换 e2e(独立 spawn: /mode 命令拦截 + plan 门禁 + /api/mode 下拉路径 + bypass 双确认)
 // 用法: npm run build && node test/web-smoke.js
 const assert = require("assert");
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 
@@ -17,12 +22,12 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const ROOT = path.resolve(__dirname, "..");
 const TOKEN = "test-token-123"; // AUTH_TOKEN 环境变量固定 → 测试确定性
 
-// token=null 不带 header(测 401); 其他值带 x-auth-token
-function fetchJson(method, url, body, token = TOKEN) {
+// token=null 不带 header(测 401); 其他值带 x-auth-token; base 供测试 18 的独立实例复用
+function fetchJson(method, url, body, token = TOKEN, base = BASE) {
   return new Promise((resolve, reject) => {
     const headers = { "Content-Type": "application/json" };
     if (token !== null) headers["x-auth-token"] = token;
-    const req = http.request(`${BASE}${url}`, { method, headers }, (res) => {
+    const req = http.request(`${base}${url}`, { method, headers }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
       res.on("end", () => resolve({ status: res.statusCode, body: data ? JSON.parse(data) : null }));
@@ -36,10 +41,10 @@ function fetchJson(method, url, body, token = TOKEN) {
 // SSE 客户端: 收集事件, 提供 waitFor 谓词(token 走 query — EventSource 不能设 header)
 // waitFor(pred, timeout, after): after = 事件快照下标, 只匹配此后到达的事件
 //   (默认 0 = 全历史; 二次发消息的用例必须传快照, 否则会命中上一轮的旧事件)
-function sseCollect(token = TOKEN) {
+function sseCollect(token = TOKEN, base = BASE) {
   const events = [];
   const waiters = [];
-  const req = http.get(`${BASE}/api/events?token=${encodeURIComponent(token)}`, (res) => {
+  const req = http.get(`${base}/api/events?token=${encodeURIComponent(token)}`, (res) => {
     let buf = "";
     res.on("data", (c) => {
       buf += c.toString();
@@ -84,7 +89,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
   // ── 启动服务器(mock 模式: 清空 ANTHROPIC_API_KEY; AUTH_TOKEN 固定;
-  //    AGENT_HARNESS_NO_KEYCHAIN=1 防止读到开发者真实 Keychain key 导致 mock 模式失效) ──
+  //    AGENT_HARNESS_NO_KEYCHAIN=1 防止读到开发者真实 Keychain key 导致 mock 模式失效;
+  //    AGENT_HARNESS_HOME 指向空临时目录 → 用户级 settings 层封闭, 不受开发机 ~/.agent-harness 影响) ──
+  const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), "web-smoke-home-"));
   const server = spawn("node", ["dist/cli.js", "web"], {
     cwd: ROOT,
     env: {
@@ -93,6 +100,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       PORT: String(PORT),
       AUTH_TOKEN: TOKEN,
       AGENT_HARNESS_NO_KEYCHAIN: "1",
+      AGENT_HARNESS_HOME: emptyHome,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -353,7 +361,289 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const first = sess2.body.sessions.find((s) => s.id !== ready2.sessionId);
     assert.ok(first, "应存在旧会话");
 
+    // 16. 会话级"总是允许" e2e: 弹窗携带 alwaysRule → always 应答 → 同会话再触发免弹窗(session-allow);
+    //     新会话不继承记忆(重新弹窗)。注意: 本块的失败工具轮会使 toolErrors +1, 必须置于 14 号 stats 断言之后
+    const cRes = await fetchJson("POST", "/api/session/new");
+    const sessC = cRes.body.sessionId;
+    await sse.waitFor((e) => e.kind === "ready" && e.sessionId === sessC, 15000);
+    const mark16 = sse.events.length; // 快照: 排除 sessC 的 ready/history
+    const sendC = await fetchJson("POST", "/api/message", { text: "看下时间", sessionId: sessC });
+    assert.strictEqual(sendC.status, 200);
+    await sse.waitFor((e) => e.kind === "tool_start" && e.sessionId === sessC && e.input.command === "ls -la", 15000, mark16);
+    // date 弹窗: 携带推导的 always 规则; Bash 无 diff 预览
+    const cPerm = await sse.waitFor(
+      (e) => e.kind === "permission_request" && e.sessionId === sessC && e.input.command === "date", 15000, mark16
+    );
+    assert.strictEqual(cPerm.alwaysRule, "Bash(date:*)", "弹窗应携带推导的 always 规则");
+    assert.strictEqual(cPerm.preview, undefined, "Bash 无 diff 预览");
+    const ansC = await fetchJson("POST", `/api/permission/${encodeURIComponent(cPerm.id)}`, { answer: "always" });
+    assert.strictEqual(ansC.status, 200);
+    await sse.waitFor((e) => e.kind === "permission_resolved" && e.id === cPerm.id && e.answer === "always", 15000, mark16);
+    const cDate = await sse.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sessC && e.input.command === "date", 15000, mark16
+    );
+    await sse.waitFor(
+      (e) => e.kind === "perm" && e.sessionId === sessC && e.source === "user" && e.decision === "allow", 15000, mark16
+    );
+    await sse.waitFor((e) => e.kind === "tool_result" && e.sessionId === sessC && e.id === cDate.id && !e.isError, 15000, mark16);
+    await sse.waitFor((e) => e.kind === "stop" && e.sessionId === sessC, 15000, mark16);
+    passed++; console.log("  ✓ always e2e: 弹窗携带 alwaysRule + always resolve + 放行执行");
+
+    // 16a. 同会话 msg2 消费 turn4/5(失败工具轮), msg3 的 date 命中会话记忆 → session-allow 免弹窗
+    const mark16b = sse.events.length;
+    await fetchJson("POST", "/api/message", { text: "失败演示", sessionId: sessC });
+    const cFail = await sse.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sessC && e.input.command === "ls /definitely-not-exist-xyz", 15000, mark16b
+    );
+    await sse.waitFor((e) => e.kind === "tool_result" && e.sessionId === sessC && e.id === cFail.id && e.isError, 15000, mark16b);
+    await sse.waitFor((e) => e.kind === "stop" && e.sessionId === sessC, 15000, mark16b);
+    const mark16c = sse.events.length;
+    await fetchJson("POST", "/api/message", { text: "再看时间", sessionId: sessC });
+    const cDate2 = await sse.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sessC && e.input.command === "date", 15000, mark16c
+    );
+    await sse.waitFor(
+      (e) => e.kind === "perm" && e.sessionId === sessC && e.source === "session-allow", 15000, mark16c
+    );
+    await sse.waitFor((e) => e.kind === "tool_result" && e.sessionId === sessC && e.id === cDate2.id && !e.isError, 15000, mark16c);
+    await sse.waitFor((e) => e.kind === "stop" && e.sessionId === sessC, 15000, mark16c);
+    assert.strictEqual(
+      sse.events.slice(mark16c).filter((e) => e.kind === "permission_request" && e.sessionId === sessC).length,
+      0,
+      "会话记忆命中后不应再弹窗"
+    );
+    passed++; console.log("  ✓ 会话级记忆: 同会话再触发 date → session-allow 免弹窗");
+
+    // 16b. 记忆不跨会话: 新会话 date 重新弹窗 → no 拒绝收尾
+    const dRes = await fetchJson("POST", "/api/session/new");
+    const sessD = dRes.body.sessionId;
+    await sse.waitFor((e) => e.kind === "ready" && e.sessionId === sessD, 15000);
+    const mark16d = sse.events.length;
+    await fetchJson("POST", "/api/message", { text: "看下时间", sessionId: sessD });
+    const dPerm = await sse.waitFor(
+      (e) => e.kind === "permission_request" && e.sessionId === sessD && e.input.command === "date", 15000, mark16d
+    );
+    assert.strictEqual(dPerm.alwaysRule, "Bash(date:*)", "新会话仍提供 always 选项(记忆不继承)");
+    const ansD = await fetchJson("POST", `/api/permission/${encodeURIComponent(dPerm.id)}`, { answer: "no" });
+    assert.strictEqual(ansD.status, 200);
+    await sse.waitFor((e) => e.kind === "permission_resolved" && e.id === dPerm.id && e.answer === "no", 15000, mark16d);
+    await sse.waitFor((e) => e.kind === "stop" && e.sessionId === sessD, 15000, mark16d);
+    passed++; console.log("  ✓ 记忆不跨会话: 新会话 date 重新弹窗 → no 收尾");
+
+    // 17. 工具输入校验 e2e: 坏输入(Bash 缺 command)被调度层形状校验拦截 → 不弹窗直接 error 结果。
+    //     sessC 已消费 mock 脚本前 7 轮(16/16a), 本轮消费 append 的第 8/9 轮;
+    //     置于 14 号 stats 断言之后(校验失败计入 toolErrors, 会使全局计数 +1, 不再断言)
+    const mark17 = sse.events.length;
+    await fetchJson("POST", "/api/message", { text: "坏输入演示", sessionId: sessC });
+    const badStart = await sse.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sessC && e.input && e.input.timeout === 30000, 15000, mark17
+    );
+    assert.strictEqual(badStart.name, "Bash");
+    const badResult = await sse.waitFor(
+      (e) => e.kind === "tool_result" && e.sessionId === sessC && e.id === badStart.id && e.isError, 15000, mark17
+    );
+    assert.ok(badResult.output.includes("工具输入校验失败(Bash)"), badResult.output);
+    assert.ok(badResult.output.includes("command") && badResult.output.includes("必填"), badResult.output);
+    await sse.waitFor((e) => e.kind === "stop" && e.sessionId === sessC, 15000, mark17);
+    assert.strictEqual(
+      sse.events.slice(mark17).filter((e) => e.kind === "permission_request" && e.sessionId === sessC).length,
+      0,
+      "校验失败先于权限瀑布, 不应弹窗"
+    );
+    passed++; console.log("  ✓ 工具输入校验 e2e: 坏输入不弹窗直接 error tool_result(计入遥测)");
+
+    // 18. 分层配置 e2e: 独立 spawn(AGENT_HARNESS_HOME 指向含用户级 allow 规则的临时目录)→
+    //     date 未命中项目级规则, 被用户级 Bash(date:*) 跨层放行 → 全程无弹窗。
+    //     独立端口 + 独立 provider → 不影响既有 17 个测试的 mock 轮次记账
+    const PORT2 = 3998;
+    const BASE2 = `http://127.0.0.1:${PORT2}`;
+    const userHome18 = fs.mkdtempSync(path.join(os.tmpdir(), "web-smoke-user-"));
+    fs.writeFileSync(path.join(userHome18, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(date:*)"] } }));
+    const server2 = spawn("node", ["dist/cli.js", "web"], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        ANTHROPIC_API_KEY: "",
+        PORT: String(PORT2),
+        AUTH_TOKEN: TOKEN,
+        AGENT_HARNESS_NO_KEYCHAIN: "1",
+        AGENT_HARNESS_HOME: userHome18,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let server2Err = "";
+    server2.stderr.on("data", (d) => (server2Err += d.toString()));
+    let up2 = false;
+    for (let i = 0; i < 40 && !up2; i++) {
+      await sleep(250);
+      try {
+        await fetchJson("GET", "/api/sessions", undefined, TOKEN, BASE2);
+        up2 = true;
+      } catch { /* 等待启动 */ }
+    }
+    assert.ok(up2, `分层配置 e2e 服务器未启动\nstderr: ${server2Err.slice(0, 1000)}`);
+    const sse18 = sseCollect(TOKEN, BASE2);
+    await sse18.waitFor((e) => e.kind === "ready"); // SSE 连接即补放活动会话 ready
+    const send18 = await fetchJson("POST", "/api/message", { text: "看下目录和时间" }, TOKEN, BASE2);
+    assert.strictEqual(send18.status, 200);
+    const ls18 = await sse18.waitFor((e) => e.kind === "tool_start" && e.input && e.input.command === "ls -la");
+    await sse18.waitFor((e) => e.kind === "tool_result" && e.id === ls18.id && !e.isError); // 项目级 Bash(ls:*) 放行
+    const date18 = await sse18.waitFor((e) => e.kind === "tool_start" && e.input && e.input.command === "date");
+    await sse18.waitFor((e) => e.kind === "tool_result" && e.id === date18.id && !e.isError); // 用户级 Bash(date:*) 放行
+    await sse18.waitFor((e) => e.kind === "stop");
+    assert.strictEqual(
+      sse18.events.filter((e) => e.kind === "permission_request").length,
+      0,
+      "用户级规则放行 date, 全程不应弹窗"
+    );
+    sse18.close();
+    server2.kill("SIGTERM");
+    fs.rmSync(userHome18, { recursive: true, force: true });
+    passed++; console.log("  ✓ 分层配置 e2e: 用户级 allow 规则跨层生效(date 免弹窗直执行)");
+
+    // 19. Slash 命令 + 模式运行中切换 e2e: 独立 spawn(独立 provider, mock 轮次从 1 起算, 不影响前 18 项)。
+    //     /mode plan → command_output + mode_changed(不入消息树);plan 下只读放行/非只读 plan-mode 拒;
+    //     /api/mode(徽章下拉路径)切回 default → date 重新弹窗;bypassPermissions 双保险(UI 400 + 命令须 --dangerous)
+    const PORT3 = 3997;
+    const BASE3 = `http://127.0.0.1:${PORT3}`;
+    const home19 = fs.mkdtempSync(path.join(os.tmpdir(), "web-smoke-home19-"));
+    const server3 = spawn("node", ["dist/cli.js", "web"], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        ANTHROPIC_API_KEY: "",
+        PORT: String(PORT3),
+        AUTH_TOKEN: TOKEN,
+        AGENT_HARNESS_NO_KEYCHAIN: "1",
+        AGENT_HARNESS_HOME: home19,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let server3Err = "";
+    server3.stderr.on("data", (d) => (server3Err += d.toString()));
+    let up3 = false;
+    for (let i = 0; i < 40 && !up3; i++) {
+      await sleep(250);
+      try {
+        await fetchJson("GET", "/api/sessions", undefined, TOKEN, BASE3);
+        up3 = true;
+      } catch { /* 等待启动 */ }
+    }
+    assert.ok(up3, `模式切换 e2e 服务器未启动\nstderr: ${server3Err.slice(0, 1000)}`);
+    const sse19 = sseCollect(TOKEN, BASE3);
+    const ready19 = await sse19.waitFor((e) => e.kind === "ready");
+    assert.strictEqual(ready19.mode, "default");
+    const sess19 = ready19.sessionId;
+
+    // 19a. /mode plan: 命令拦截 → command_output + mode_changed;不进消息树不触发 LLM(mock 轮次零消耗)
+    const mark19a = sse19.events.length;
+    const cmd19 = await fetchJson("POST", "/api/message", { text: "/mode plan", sessionId: sess19 }, TOKEN, BASE3);
+    assert.strictEqual(cmd19.status, 200);
+    assert.strictEqual(cmd19.body.command, true);
+    await sse19.waitFor(
+      (e) => e.kind === "command_output" && e.sessionId === sess19 && e.text.includes("权限模式已切换: plan"), 15000, mark19a
+    );
+    await sse19.waitFor((e) => e.kind === "mode_changed" && e.sessionId === sess19 && e.mode === "plan", 15000, mark19a);
+    assert.strictEqual(
+      sse19.events.slice(mark19a).filter((e) => e.kind === "user_message" || e.kind === "tool_start").length,
+      0,
+      "命令不入消息树不触发工具"
+    );
+    passed++; console.log("  ✓ /mode 命令 e2e: command_output + mode_changed, 不入消息树不消耗 LLM 轮次");
+
+    // 19b. plan 语义: 消息消费 mock 轮 1-3 → ls -la 只读放行(static);date 非只读 → plan-mode 拒(不弹窗)
+    const mark19b = sse19.events.length;
+    await fetchJson("POST", "/api/message", { text: "看下目录和时间", sessionId: sess19 }, TOKEN, BASE3);
+    const ls19 = await sse19.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sess19 && e.input && e.input.command === "ls -la", 15000, mark19b
+    );
+    await sse19.waitFor(
+      (e) => e.kind === "perm" && e.sessionId === sess19 && e.source === "static" && e.decision === "allow", 15000, mark19b
+    );
+    await sse19.waitFor((e) => e.kind === "tool_result" && e.sessionId === sess19 && e.id === ls19.id && !e.isError, 15000, mark19b);
+    const date19 = await sse19.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sess19 && e.input && e.input.command === "date", 15000, mark19b
+    );
+    await sse19.waitFor(
+      (e) => e.kind === "perm" && e.sessionId === sess19 && e.source === "plan-mode" && e.decision === "deny", 15000, mark19b
+    );
+    await sse19.waitFor((e) => e.kind === "tool_result" && e.sessionId === sess19 && e.id === date19.id && e.isError, 15000, mark19b);
+    await sse19.waitFor((e) => e.kind === "stop" && e.sessionId === sess19, 15000, mark19b);
+    assert.strictEqual(sse19.events.slice(mark19b).filter((e) => e.kind === "permission_request").length, 0, "plan 拒绝不弹窗");
+    passed++; console.log("  ✓ plan 模式 e2e: 只读放行, 非只读 plan-mode 拒绝(无弹窗)");
+
+    // 19c. /api/mode(徽章下拉路径)切回 default: mode_changed + history 实时回显;UI 不暴露 bypassPermissions(400)
+    const mark19c = sse19.events.length;
+    const mode19 = await fetchJson("POST", "/api/mode", { mode: "default", sessionId: sess19 }, TOKEN, BASE3);
+    assert.strictEqual(mode19.status, 200);
+    await sse19.waitFor((e) => e.kind === "mode_changed" && e.sessionId === sess19 && e.mode === "default", 15000, mark19c);
+    const hist19 = await fetchJson("GET", `/api/session/history?sessionId=${encodeURIComponent(sess19)}`, undefined, TOKEN, BASE3);
+    assert.strictEqual(hist19.body.mode, "default", "历史端点回显实时模式");
+    const badMode19 = await fetchJson("POST", "/api/mode", { mode: "bypassPermissions", sessionId: sess19 }, TOKEN, BASE3);
+    assert.strictEqual(badMode19.status, 400, "bypassPermissions 不在 UI 暴露");
+    passed++; console.log("  ✓ /api/mode 端点: 下拉切换 + history 实时回显 + bypassPermissions 400");
+
+    // 19d. 消费 mock 轮 4-5(ls /definitely-not-exist → 真实失败但 default 放行)
+    const mark19d = sse19.events.length;
+    await fetchJson("POST", "/api/message", { text: "失败演示", sessionId: sess19 }, TOKEN, BASE3);
+    const fail19 = await sse19.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sess19 && e.input && e.input.command === "ls /definitely-not-exist-xyz", 15000, mark19d
+    );
+    await sse19.waitFor((e) => e.kind === "tool_result" && e.sessionId === sess19 && e.id === fail19.id && e.isError, 15000, mark19d);
+    await sse19.waitFor((e) => e.kind === "stop" && e.sessionId === sess19, 15000, mark19d);
+
+    // 19e. default 下 date 重新弹窗(切换后弹窗链路完好)→ yes 放行 → 消费 mock 轮 6-7
+    const mark19e = sse19.events.length;
+    await fetchJson("POST", "/api/message", { text: "再看时间", sessionId: sess19 }, TOKEN, BASE3);
+    const date19b = await sse19.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sess19 && e.input && e.input.command === "date", 15000, mark19e
+    );
+    const perm19 = await sse19.waitFor(
+      (e) => e.kind === "permission_request" && e.sessionId === sess19 && e.input && e.input.command === "date", 15000, mark19e
+    );
+    await fetchJson("POST", `/api/permission/${encodeURIComponent(perm19.id)}`, { answer: "yes" }, TOKEN, BASE3);
+    await sse19.waitFor((e) => e.kind === "tool_result" && e.sessionId === sess19 && e.id === date19b.id && !e.isError, 15000, mark19e);
+    await sse19.waitFor((e) => e.kind === "stop" && e.sessionId === sess19, 15000, mark19e);
+    passed++; console.log("  ✓ 模式切回后弹窗链路完好: date → 弹窗 → yes 放行执行");
+
+    // 19f. 命令矩阵: 未知模式报错;bypass 无 --dangerous 拒 / 带 --dangerous 切;/status /permissions 回流;切回 default
+    const mark19f = sse19.events.length;
+    await fetchJson("POST", "/api/message", { text: "/mode fast", sessionId: sess19 }, TOKEN, BASE3);
+    await sse19.waitFor(
+      (e) => e.kind === "command_output" && e.sessionId === sess19 && e.text.includes("未知模式"), 15000, mark19f
+    );
+    await fetchJson("POST", "/api/message", { text: "/mode bypassPermissions", sessionId: sess19 }, TOKEN, BASE3);
+    await sse19.waitFor(
+      (e) => e.kind === "command_output" && e.sessionId === sess19 && e.text.includes("--dangerous"), 15000, mark19f
+    );
+    assert.strictEqual(
+      sse19.events.slice(mark19f).filter((e) => e.kind === "mode_changed").length, 0,
+      "非法/未确认切换不应产生 mode_changed"
+    );
+    await fetchJson("POST", "/api/message", { text: "/mode bypassPermissions --dangerous", sessionId: sess19 }, TOKEN, BASE3);
+    await sse19.waitFor(
+      (e) => e.kind === "mode_changed" && e.sessionId === sess19 && e.mode === "bypassPermissions", 15000, mark19f
+    );
+    await fetchJson("POST", "/api/message", { text: "/status", sessionId: sess19 }, TOKEN, BASE3);
+    await sse19.waitFor(
+      (e) => e.kind === "command_output" && e.sessionId === sess19 && e.text.includes("[status]") && e.text.includes("bypassPermissions"), 15000, mark19f
+    );
+    await fetchJson("POST", "/api/message", { text: "/permissions", sessionId: sess19 }, TOKEN, BASE3);
+    await sse19.waitFor(
+      (e) => e.kind === "command_output" && e.sessionId === sess19 && e.text.includes("[permissions]"), 15000, mark19f
+    );
+    await fetchJson("POST", "/api/message", { text: "/mode default", sessionId: sess19 }, TOKEN, BASE3);
+    await sse19.waitFor(
+      (e) => e.kind === "mode_changed" && e.sessionId === sess19 && e.mode === "default", 15000, mark19f
+    );
+    passed++; console.log("  ✓ 命令矩阵: 未知模式/双确认 bypass/状态与规则回流/切回 default");
+
+    sse19.close();
+    server3.kill("SIGTERM");
+    fs.rmSync(home19, { recursive: true, force: true });
+
     sse.close();
+    fs.rmSync(emptyHome, { recursive: true, force: true });
     console.log(`\n[web-smoke] 全部通过: ${passed} 项`);
     server.kill("SIGTERM");
     process.exit(0);

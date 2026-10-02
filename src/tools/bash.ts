@@ -5,6 +5,7 @@ import { Tool, ToolContext } from "./tool";
 import { checkBashCommand } from "../permissions/staticChecks";
 
 const EXEC_TIMEOUT_MS = 30_000;
+const MAX_TIMEOUT_MS = 600_000; // 超时上界(10 分钟, 对齐 Claude Code 惯例)
 const MAX_OUTPUT_CHARS = 200_000; // 硬上限(T0 预算层之前先兜底)
 
 export class BashTool implements Tool {
@@ -25,7 +26,17 @@ export class BashTool implements Tool {
 
   async execute(input: Record<string, unknown>, ctx?: ToolContext): Promise<ToolResult> {
     const command = String(input.command ?? "");
-    const timeout = Number(input.timeout ?? EXEC_TIMEOUT_MS);
+    if (!command.trim()) return { content: "参数错误: command 不能为空", isError: true };
+    // timeout: 调度层 validator 已保证 number(若传); 此处直调保险 + 越界报错而非 clamp
+    // (静默 clamp 会让模型误以为自己的值生效了; NaN → setTimeout(NaN) 视作 0 会立即 kill 命令)
+    const rawTimeout = input.timeout;
+    if (rawTimeout !== undefined && rawTimeout !== null) {
+      const t = Number(rawTimeout);
+      if (!Number.isFinite(t) || t <= 0 || t > MAX_TIMEOUT_MS) {
+        return { content: `参数错误: timeout 须为 1-${MAX_TIMEOUT_MS} ms(收到 ${JSON.stringify(rawTimeout)})`, isError: true };
+      }
+    }
+    const timeout = rawTimeout !== undefined && rawTimeout !== null ? Number(rawTimeout) : EXEC_TIMEOUT_MS;
 
     return new Promise<ToolResult>((resolve) => {
       const child = spawn("bash", ["-c", command], {

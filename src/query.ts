@@ -16,6 +16,7 @@ import { reactiveCompact } from "./compact/reactiveCompact";
 import { PermissionEngine } from "./permissions/engine";
 import { HookRunner } from "./hooks/runner";
 import { ToolRegistry } from "./tools/tool";
+import { validateToolInput, formatValidationIssues } from "./tools/validate";
 import { UiEvent } from "./events";
 import { Telemetry } from "./telemetry/telemetry";
 
@@ -301,6 +302,20 @@ export async function runQuery(
           type: "tool_result",
           tool_use_id: tu.id,
           content: `未知工具: ${tu.name}`,
+          is_error: true,
+        };
+      }
+      // 形状校验前置: 垃圾输入不进权限瀑布/不弹窗/不跑 PostToolUse, 也不派生错误记忆规则
+      // (如 command: null 会被 String() 转成 "null" 记忆出 Bash(null:*)); 失败以 error 结果
+      // 入树 → 模型下一轮自修正(tool_use 必有配对 tool_result, 消息树一致性)
+      const issues = validateToolInput(tool.inputSchema, tu.input);
+      if (issues.length > 0) {
+        deps.telemetry?.recordToolError(); // 遥测: 模型坏调用(同未知工具口径; 权限拒绝/中断不计)
+        deps.log(`[validate] ${tu.name} 输入校验失败: ${issues.map((i) => `${i.field}: ${i.problem}`).join("; ")}`);
+        return {
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: formatValidationIssues(tu.name, tool.inputSchema, tu.input, issues),
           is_error: true,
         };
       }

@@ -23,7 +23,8 @@ import * as crypto from "crypto";
 import { LLMProvider, MockProvider, ScriptedTurn } from "../llm/provider";
 import { AnthropicProvider } from "../llm/anthropicProvider";
 import { EventBus, UiEvent, historyFromMessages } from "../events";
-import { PermissionAsk, PermissionMode } from "../permissions/engine";
+import { PermissionAsk, PermissionAnswer, PermissionMode } from "../permissions/engine";
+import { dispatchSlashCommand, CommandContext } from "../commands";
 import { resolveApiKey } from "../credentials/keychain";
 import { getTelemetry } from "../telemetry/telemetry";
 import {
@@ -35,6 +36,7 @@ import {
   Session,
 } from "../cli";
 import { PRODUCTION_COMPACT_CONFIG, computeWatermarks } from "../compact/watermarks";
+import { MergedSettings, composeSystemPrompt, resolveModel } from "../settings/loader";
 
 const PORT = Number(process.env.PORT ?? 3218);
 // 默认只绑定回环地址: 未鉴权的局域网暴露 = 任何人可发消息/替答权限弹窗(= 远程授权任意 Bash)
@@ -57,6 +59,14 @@ const WEB_MOCK_SCRIPT: ScriptedTurn[] = [
   },
   { toolUses: [{ name: "Bash", input: { command: "ls /definitely-not-exist-xyz" } }] },
   { text: "第 4 轮工具按预期失败(mock 演示): 该结果计入遥测 toolErrors(GET /api/stats)。" },
+  // 会话级"总是允许"e2e(web-smoke): 第三条消息再触发 date —
+  // 曾选 always 的会话直接 session-allow 放行(无第二次弹窗); 新会话则重新弹窗
+  { toolUses: [{ name: "Bash", input: { command: "date" } }] },
+  { text: "第二次 date 完成(mock 演示会话级权限记忆: 总是允许后免弹窗)。" },
+  // 工具输入校验 e2e(web-smoke 测试 17): Bash 缺 command → 调度层形状校验拦截
+  // (先于权限瀑布, 不弹窗)→ error tool_result, 计入遥测 toolErrors
+  { toolUses: [{ name: "Bash", input: { timeout: 30000 } }] },
+  { text: "坏输入演示完成(mock): 缺 command 的调用被输入校验拦截, 未弹窗直接报错。" },
 ];
 
 const bus = new EventBus();
@@ -65,13 +75,17 @@ const bus = new EventBus();
 interface Live {
   id: string;
   session: Session;
-  meta: { model: string; mode: PermissionMode; provider: string };
+  // mode 不做快照: 徽章/历史/统计一律实时读 session.deps.permissions.mode(运行中 /mode 可切换)
+  meta: { model: string; provider: string };
   sendChain: Promise<void>; // 会话内消息串行(对照 CLI readline 行级串行); 跨会话互不阻塞
   running: boolean; // 是否有 send 在飞(切换会话时前端据此恢复 停止按钮/输入框 状态)
 }
 const liveSessions = new Map<string, Live>();
 let lastActiveId: string | null = null; // 最近激活的会话(不带 sessionId 的请求默认目标, 兼容旧客户端)
 let webSessSeq = 0;
+
+// 会话当前权限模式(实时值 — /mode 与 /api/mode 均可运行中切换)
+const liveMode = (live: Live): PermissionMode => live.session.deps.permissions.mode;
 
 // SSE 事件标记: 所有事件带 sessionId → 前端按当前视图过滤(多标签页各看各的会话)
 type TaggedEvent = UiEvent & { sessionId: string };
@@ -83,16 +97,25 @@ function tagged(sessionId: string, e: UiEvent): TaggedEvent {
 // 挂起请求保存完整事件(带 sessionId)→ SSE 重连/页面刷新时补放(否则弹窗丢失, 引擎永久挂起)
 interface PendingPerm {
   sessionId: string;
-  resolve: (answer: "yes" | "no") => void;
+  resolve: (answer: PermissionAnswer) => void;
   req: Extract<UiEvent, { kind: "permission_request" }>;
 }
 // 全局表(perm id 全局唯一), 冲洗按会话过滤 → abort/驱逐只影响目标会话
 const pendingPerms = new Map<string, PendingPerm>();
 let permSeq = 0;
 const makeUserResponder = (sessionId: string) => (ask: PermissionAsk) =>
-  new Promise<"yes" | "no">((resolve) => {
+  new Promise<PermissionAnswer>((resolve) => {
     const id = `perm_${++permSeq}`;
-    const req = { kind: "permission_request" as const, id, toolName: ask.toolName, reason: ask.why, input: ask.toolInput };
+    const req = {
+      kind: "permission_request" as const,
+      id,
+      toolName: ask.toolName,
+      reason: ask.why,
+      input: ask.toolInput,
+      // 新字段仅存在时展开(undefined 会被 JSON.stringify 丢弃, 但类型上保持干净)
+      ...(ask.preview ? { preview: ask.preview } : {}),
+      ...(ask.alwaysRule ? { alwaysRule: ask.alwaysRule } : {}),
+    };
     pendingPerms.set(id, { sessionId, resolve, req });
     bus.emit(tagged(sessionId, req));
   });
@@ -136,11 +159,35 @@ function enqueueSend(live: Live, text: string): void {
     });
 }
 
+// ── Web 命令上下文: slash 命令与 CLI 共用注册表, 输出经 command_output 事件回流(前端渲染系统行);
+//    /exit 无进程可退 → 提示直接关标签页。命令不入消息树不进 LLM ──
+const webCommandCtx = (live: Live): CommandContext => ({
+  getMode: () => liveMode(live),
+  setMode: (m) => live.session.setMode(m),
+  status: () =>
+    `[status] 会话 ${live.id} | 权限模式 ${liveMode(live)}\n` +
+    `[status] 轮次 ${live.session.state.turnCount} | 累计计费 tokens ${live.session.state.totalTokensUsed} | ` +
+      `错误 ${getTelemetry(PROJECT_ROOT).sessionErrorCount(live.id)} 次\n` +
+    `[status] transcript: ${live.session.transcriptPath}`,
+  permissionsSummary: () => {
+    const p = live.session.deps.permissions;
+    const c = p.ruleCounts;
+    return (
+      `[permissions] 分层合并后规则: allow ${c.allow} | deny ${c.deny} | ask ${c.ask}\n` +
+      `[permissions] 会话内"总是允许"记忆 ${p.sessionAllowCount} 条(仅本会话)`
+    );
+  },
+  log: (line) => bus.emit(tagged(live.id, { kind: "command_output", text: line })),
+  exit: () =>
+    bus.emit(tagged(live.id, { kind: "command_output", text: "[exit] Web 端无进程可退, 直接关闭浏览器标签页即可" })),
+});
+
 // ── 会话初始化/切换 ──
-function makeProvider(): { provider: LLMProvider; model: string; mode: PermissionMode; providerName: string } {
+// model 解析序: env ANTHROPIC_MODEL > settings 分层合并(本地>项目>用户) > 内置默认(见 settings/loader)
+function makeProvider(merged: Pick<MergedSettings, "model">): { provider: LLMProvider; model: string; mode: PermissionMode; providerName: string } {
   const resolved = resolveApiKey();
   if (resolved) {
-    const model = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
+    const model = resolveModel(merged);
     console.log(`[web] API key 来源: ${resolved.source === "env" ? "环境变量" : "macOS Keychain"} → 真实模型 ${model}`);
     return {
       provider: new AnthropicProvider({ apiKey: resolved.apiKey, model, log: (l) => console.log(l) }),
@@ -158,7 +205,7 @@ function broadcastReady(live: Live): void {
     kind: "ready",
     sessionId: live.id,
     model: live.meta.model,
-    mode: live.meta.mode,
+    mode: liveMode(live),
     provider: live.meta.provider,
   }));
   bus.emit(tagged(live.id, { kind: "history", events: historyFromMessages(live.session.state.messages) }));
@@ -175,14 +222,17 @@ async function activateSession(opts: { resumeId?: string } = {}): Promise<string
     broadcastReady(live);
     return lastActiveId;
   }
-  const { rules, hookSettings, mcpServers, engine } = loadSettings();
-  const p = makeProvider();
+  // settings 每次新会话重读 → 分层合并的变更即时生效(热加载仅覆盖规则/Hook, 见 createSession)
+  const merged = loadSettings();
+  const { rules, hookSettings, mcpServers, engine } = merged;
+  const p = makeProvider(merged);
   const sessionId = opts.resumeId ?? `sess_web_${Date.now()}_${++webSessSeq}`;
   const emit = (e: UiEvent) => bus.emit(tagged(sessionId, e));
   const session = await createSession({
     provider: p.provider,
     cfg: PRODUCTION_COMPACT_CONFIG,
-    systemPrompt: CHAT_SYSTEM_PROMPT,
+    // 内置基线 + settings 各层追加段(append-only; 真实模型下注入领域上下文)
+    systemPrompt: composeSystemPrompt(CHAT_SYSTEM_PROMPT, merged),
     rules,
     hookSettings,
     mcpServers,
@@ -200,7 +250,7 @@ async function activateSession(opts: { resumeId?: string } = {}): Promise<string
   const live: Live = {
     id: sessionId,
     session,
-    meta: { model: p.model, mode: p.mode, provider: p.providerName },
+    meta: { model: p.model, provider: p.providerName },
     sendChain: Promise.resolve(),
     running: false,
   };
@@ -299,7 +349,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           kind: "ready",
           sessionId: live.id,
           model: live.meta.model,
-          mode: live.meta.mode,
+          mode: liveMode(live),
           provider: live.meta.provider,
         }))}\n\n`);
         res.write(`data: ${JSON.stringify(tagged(live.id, { kind: "history", events: historyFromMessages(live.session.state.messages) }))}\n\n`);
@@ -348,7 +398,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return json(res, 200, {
       sessionId: id,
       model: live.meta.model,
-      mode: live.meta.mode,
+      mode: liveMode(live), // 实时值(运行中 /mode 切换后切换视图正确回显)
       provider: live.meta.provider,
       running: live.running,
       events: historyFromMessages(live.session.state.messages),
@@ -366,7 +416,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       liveSessions: [...liveSessions.values()].map((l) => ({
         id: l.id,
         model: l.meta.model,
-        mode: l.meta.mode,
+        mode: liveMode(l),
         provider: l.meta.provider,
         running: l.running,
         turns: l.session.state.turnCount,
@@ -383,9 +433,30 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!text) return json(res, 400, { error: "text 不能为空" });
     const target = targetSession(body);
     if ("error" in target) return json(res, target.code, { error: target.error });
+    // slash 命令拦截(与 CLI chat REPL 共用注册表): 命中 → command_output 事件回流,
+    // 不入消息树/不进 LLM/不消耗 mock 轮次; 未知 /xxx 同样拦截(防误发给模型)
+    if (dispatchSlashCommand(text, webCommandCtx(target))) {
+      return json(res, 200, { ok: true, sessionId: target.id, command: true });
+    }
     bus.emit(tagged(target.id, { kind: "user_message", text })); // 用户消息事件(引擎只写 transcript, 不回发)
     enqueueSend(target, text);
     return json(res, 200, { ok: true, sessionId: target.id });
+  }
+
+  // 运行中权限模式切换(topbar 徽章下拉): 与 CLI /mode 同一 setMode 路径(双通道即时);
+  // bypassPermissions 不在 UI 暴露(高风险 — 须显式 /mode bypassPermissions --dangerous 命令)
+  if (req.method === "POST" && url === "/api/mode") {
+    const body = await readBody(req);
+    const target = targetSession(body);
+    if ("error" in target) return json(res, target.code, { error: target.error });
+    const mode = typeof body.mode === "string" ? body.mode : "";
+    if (mode !== "default" && mode !== "auto" && mode !== "plan") {
+      return json(res, 400, {
+        error: `无效模式: ${mode || "(空)"} | Web 可切换: default | auto | plan(bypassPermissions 须用 /mode bypassPermissions --dangerous)`,
+      });
+    }
+    target.session.setMode(mode as PermissionMode);
+    return json(res, 200, { ok: true, mode, sessionId: target.id });
   }
 
   const permMatch = url.match(/^\/api\/permission\/([\w.:-]+)$/);
@@ -394,7 +465,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const pending = pendingPerms.get(id);
     if (!pending) return json(res, 404, { error: "无此权限请求(可能已应答)" });
     const body = await readBody(req);
-    const answer = body.answer === "yes" ? "yes" : "no";
+    const answer: PermissionAnswer = body.answer === "yes" ? "yes" : body.answer === "always" ? "always" : "no";
     pendingPerms.delete(id);
     pending.resolve(answer);
     bus.emit(tagged(pending.sessionId, { kind: "permission_resolved", id, answer }));

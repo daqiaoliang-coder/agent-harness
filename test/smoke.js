@@ -8,6 +8,7 @@ const http = require("http");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawn } = require("child_process");
 
 const { EditTool } = require("../dist/tools/edit");
 const { ReadTool } = require("../dist/tools/read");
@@ -25,6 +26,12 @@ const { DEMO_COMPACT_CONFIG } = require("../dist/compact/watermarks");
 const { AnthropicProvider } = require("../dist/llm/anthropicProvider");
 const { ContextWindowExceededError } = require("../dist/llm/provider");
 const { loadTranscript, repairTranscript } = require("../dist/session/resume");
+const { buildPermissionPreview, deriveAlwaysRule } = require("../dist/permissions/preview");
+const { validateToolInput, formatValidationIssues } = require("../dist/tools/validate");
+const { resolveLayerPaths, mergeSettings, loadMergedSettings, composeSystemPrompt, resolveModel } = require("../dist/settings/loader");
+const { dispatchSlashCommand, PLAN_MODE_SUFFIX } = require("../dist/commands");
+const { createSession, SESSIONS_DIR } = require("../dist/cli");
+const { estimateTokens } = require("../dist/context/tokenEstimator");
 
 let passed = 0;
 async function test(name, fn) {
@@ -926,6 +933,864 @@ exit 1
     fs.rmSync(dirT, { recursive: true, force: true });
   });
 
+  // ---------- Part 9: 权限弹窗 UX(always 会话记忆 / diff 预览 / fileState 无污染) ----------
+  console.log("[9] 权限弹窗 UX: always 记忆 + diff 预览");
+  const dirP = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-perm-"));
+  const mkPermEngine = (rules, responder) =>
+    new PermissionEngine({
+      rules,
+      hooks: new HookRunner(parseHookSettings({}), dirP, () => {}),
+      provider: new MockProvider([]),
+      mode: "default",
+      userResponder: responder,
+      session: { sessionId: "s", transcriptPath: "/dev/null", cwd: dirP },
+      log: () => {},
+    });
+  const bashP = new BashTool();
+  const editP = new EditTool();
+
+  await test("always 应答: 推导前缀规则 + 会话内后续免弹窗 + 静态 ask 不被记忆压过", async () => {
+    const seen = [];
+    const eng = mkPermEngine({ allow: [], deny: [], ask: [] }, async (req) => {
+      seen.push(req);
+      return seen.length === 1 ? "always" : "no";
+    });
+    // 兜底弹窗(offerAlways=true) → 选 always → 记住 Bash(git push:*)
+    const r1 = await eng.check(bashP, { command: "git push origin main" }, []);
+    assert.strictEqual(r1.decision, "allow");
+    assert.strictEqual(r1.source, "user");
+    assert.ok(r1.reason.includes("会话记忆"), JSON.stringify(r1));
+    assert.strictEqual(seen[0].alwaysRule, "Bash(git push:*)");
+    assert.strictEqual(seen[0].preview, undefined, "Bash 无 diff 预览");
+    // 同前缀新参数 → ⑤' 会话记忆层直接放行, 不再弹窗
+    const r2 = await eng.check(bashP, { command: "git push origin other" }, []);
+    assert.strictEqual(r2.decision, "allow");
+    assert.strictEqual(r2.source, "session-allow");
+    assert.strictEqual(seen.length, 1, "第二次不应弹窗");
+    // 静态 ask(git push --force)在记忆层之前 → 仍需确认, 且不提供 always 选项
+    const r3 = await eng.check(bashP, { command: "git push --force origin main" }, []);
+    assert.strictEqual(r3.decision, "deny");
+    assert.strictEqual(r3.source, "user");
+    assert.strictEqual(seen[1].alwaysRule, undefined, "静态 ask 路径不提供总是允许");
+  });
+
+  await test("deny 规则/静态检查不可被记忆压过 + updateRules 热加载不清会话记忆", async () => {
+    const eng = mkPermEngine({ allow: [], deny: [], ask: [] }, async () => "always");
+    await eng.check(bashP, { command: "git push origin main" }, []); // 建立 sessionAllows
+    // 注入 deny 规则(热加载) → ① 层优先于 ⑤'
+    eng.updateRules({ allow: [], deny: ["Bash(git push:*)"], ask: [] });
+    const r1 = await eng.check(bashP, { command: "git push origin x" }, []);
+    assert.strictEqual(r1.decision, "deny");
+    assert.strictEqual(r1.source, "rule-deny");
+    // 清空规则 → 会话记忆仍在(仅内存态, 热加载只换 rules)
+    eng.updateRules({ allow: [], deny: [], ask: [] });
+    const r2 = await eng.check(bashP, { command: "git push origin x" }, []);
+    assert.strictEqual(r2.source, "session-allow");
+    // 静态 deny(rm -rf 复合段)优先于记忆
+    const r3 = await eng.check(bashP, { command: "git push || rm -rf /" }, []);
+    assert.strictEqual(r3.decision, "deny");
+    assert.strictEqual(r3.source, "static");
+  });
+
+  await test("Edit 工具级记忆 + 会话记忆压过 settings ask 规则", async () => {
+    let calls = 0;
+    const eng = mkPermEngine({ allow: [], deny: [], ask: ["Bash(npm test:*)"] }, async () => {
+      calls++;
+      return "always";
+    });
+    const f = path.join(dirP, "t3.txt");
+    fs.writeFileSync(f, "x\n", "utf8");
+    // Edit → 兜底弹窗 → always → 记住工具级 "Edit"(任意参数)
+    const e1 = await eng.check(editP, { path: f, old_string: "x", new_string: "y" }, []);
+    assert.strictEqual(e1.decision, "allow");
+    assert.strictEqual(e1.source, "user");
+    const e2 = await eng.check(editP, { path: f, old_string: "y", new_string: "z" }, []);
+    assert.strictEqual(e2.source, "session-allow");
+    assert.strictEqual(calls, 1, "第二次 Edit 免弹窗");
+    // ask 规则命中 → offerAlways=true → always 记住 Bash(npm test:*)
+    const b1 = await eng.check(bashP, { command: "npm test" }, []);
+    assert.strictEqual(b1.decision, "allow");
+    assert.strictEqual(b1.source, "user");
+    assert.strictEqual(calls, 2);
+    // 同前缀变参 → ⑤'(在 ask 规则之前)放行
+    const b2 = await eng.check(bashP, { command: "npm test -- --grep x" }, []);
+    assert.strictEqual(b2.source, "session-allow");
+    assert.strictEqual(calls, 2, "ask 前缀变参免弹窗");
+  });
+
+  await test("复合命令精确记忆 + deriveAlwaysRule 规则推导矩阵", async () => {
+    let calls = 0;
+    const eng = mkPermEngine({ allow: [], deny: [], ask: [] }, async () => {
+      calls++;
+      return calls === 1 ? "always" : "no";
+    });
+    // 复合命令(含 &&)→ 只记完整命令本身(前缀 = 全命令), 不放宽
+    await eng.check(bashP, { command: "npm test && git status" }, []);
+    assert.strictEqual(calls, 1);
+    const r2 = await eng.check(bashP, { command: "npm test && git status" }, []);
+    assert.strictEqual(r2.source, "session-allow", "逐字重复命中");
+    assert.strictEqual(calls, 1);
+    const r3 = await eng.check(bashP, { command: "npm test && git push" }, []);
+    assert.strictEqual(r3.decision, "deny", "拼接不同命令不放宽");
+    assert.strictEqual(calls, 2, "复合变体必须重新弹窗");
+    // 推导矩阵单元断言
+    assert.strictEqual(deriveAlwaysRule("Bash", { command: "git push origin main" }), "Bash(git push:*)");
+    assert.strictEqual(deriveAlwaysRule("Bash", { command: "ls -la" }), "Bash(ls:*)");
+    assert.strictEqual(
+      deriveAlwaysRule("Bash", { command: "echo a:b && ls" }),
+      "Bash(echo a:b && ls:*)",
+      "复合命令含冒号 → :* 后缀防 parseRule 前缀截断"
+    );
+    assert.strictEqual(deriveAlwaysRule("Edit", { path: "/tmp/x" }), "Edit");
+    assert.strictEqual(deriveAlwaysRule("mcp__echo__echo", { text: "hi" }), "mcp__echo__echo");
+    assert.strictEqual(deriveAlwaysRule("Bash", { command: "" }), undefined);
+  });
+
+  await test("buildPermissionPreview: Edit/Write diff 预览 + 不污染 fileState", async () => {
+    const f = path.join(dirP, "p.txt");
+    fs.writeFileSync(f, "line1\nline2\nline3\nline4\nline5\n", "utf8");
+    // Edit 正常预览: 上下文 + del/add + 无 note
+    const pv = buildPermissionPreview("Edit", { path: f, old_string: "line3", new_string: "LINE3" }, dirP);
+    assert.strictEqual(pv.type, "edit");
+    assert.ok(pv.lines.some((l) => l.op === "del" && l.text === "line3"), JSON.stringify(pv.lines));
+    assert.ok(pv.lines.some((l) => l.op === "add" && l.text === "LINE3"));
+    assert.ok(pv.lines.filter((l) => l.op === "ctx").length >= 2, "命中前后有上下文行");
+    assert.strictEqual(pv.note, undefined);
+    // old_string 未找到 → 风险提示(执行将失败)
+    const pv2 = buildPermissionPreview("Edit", { path: f, old_string: "zzz", new_string: "x" }, dirP);
+    assert.ok(pv2.note.includes("未在文件中找到"), pv2.note);
+    // 多处匹配 → 不唯一提示
+    const pv3 = buildPermissionPreview("Edit", { path: f, old_string: "line", new_string: "x" }, dirP);
+    assert.ok(pv3.note.includes("出现 5 次"), pv3.note);
+    // Write 新文件: 全 add + 行数标注(尾换行 → split 出 3 行)
+    const f2 = path.join(dirP, "new.txt");
+    const pw = buildPermissionPreview("Write", { path: f2, content: "a\nb\n" }, dirP);
+    assert.strictEqual(pw.type, "write-new");
+    assert.deepStrictEqual(pw.lines.map((l) => l.op), ["add", "add", "add"]);
+    // Write 覆盖: 公共前后缀裁剪 + del/add + 行数对比
+    const f3 = path.join(dirP, "over.txt");
+    fs.writeFileSync(f3, "a\nc\n", "utf8");
+    const po = buildPermissionPreview("Write", { path: f3, content: "a\nb\n" }, dirP);
+    assert.strictEqual(po.type, "write-overwrite");
+    assert.ok(po.lines.some((l) => l.op === "del" && l.text === "c"), JSON.stringify(po.lines));
+    assert.ok(po.lines.some((l) => l.op === "add" && l.text === "b"));
+    assert.ok(po.note.includes("3 行 → 3 行"), po.note);
+    // 非 Edit/Write 工具 / 缺 path → undefined(UI 回落 JSON 渲染)
+    assert.strictEqual(buildPermissionPreview("Bash", { command: "ls" }, dirP), undefined);
+    assert.strictEqual(buildPermissionPreview("Edit", { old_string: "a" }, dirP), undefined);
+    // 无污染: 预览只读文件, Edit 仍要求先 Read(fileState 未被权限层虚假满足)
+    const r = await editP.execute({ path: f, old_string: "line3", new_string: "LINE3" });
+    assert.ok(r.isError && r.content.includes("has not been read"), JSON.stringify(r));
+  });
+
+  fs.rmSync(dirP, { recursive: true, force: true });
+
+  // ---------- Part 10: 工具输入校验(形状校验前置 + 语义修正) ----------
+  console.log("[10] 工具输入校验");
+  const dirV = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-validate-"));
+  const bashV = new BashTool();
+  const taskV = new TaskTool(async () => "子代理报告");
+
+  // -- validator 单元: 形状检查(required + 严格 typeof) --
+  await test("validator: 合法输入通过(零 issue)", async () => {
+    assert.deepStrictEqual(validateToolInput(new WriteTool().inputSchema, { path: "/tmp/a.txt", content: "hi" }), []);
+    assert.deepStrictEqual(validateToolInput(bashV.inputSchema, { command: "ls" }), []);
+  });
+
+  await test("validator: 必填字段缺失(Write 缺 content — 审计最危险缺口)", async () => {
+    const issues = validateToolInput(new WriteTool().inputSchema, { path: "/tmp/a.txt" });
+    assert.strictEqual(issues.length, 1);
+    assert.strictEqual(issues[0].field, "content");
+    assert.ok(issues[0].problem.includes("必填"), JSON.stringify(issues));
+  });
+
+  await test("validator: 严格 typeof(字符串 timeout / 数字 path / 字符串 replace_all 全拒)", async () => {
+    const issues1 = validateToolInput(bashV.inputSchema, { command: "ls", timeout: "30000" });
+    assert.ok(issues1.length === 1 && issues1[0].field === "timeout" && issues1[0].problem.includes("number"), JSON.stringify(issues1));
+    const issues2 = validateToolInput(new ReadTool().inputSchema, { path: 123 });
+    assert.ok(issues2.length === 1 && issues2[0].problem.includes("string"), JSON.stringify(issues2));
+    const issues3 = validateToolInput(new EditTool().inputSchema, {
+      path: "/a", old_string: "x", new_string: "y", replace_all: "true",
+    });
+    assert.ok(issues3.length === 1 && issues3[0].field === "replace_all" && issues3[0].problem.includes("boolean"), JSON.stringify(issues3));
+  });
+
+  await test("validator: input 非对象(null/数组/标量)→ (input) 问题", async () => {
+    const s = new WriteTool().inputSchema;
+    for (const bad of [null, [1, 2], "str", 42]) {
+      const issues = validateToolInput(s, bad);
+      assert.ok(issues.length === 1 && issues[0].field === "(input)", JSON.stringify(issues));
+    }
+  });
+
+  await test("validator: NaN 拒绝(number 须 finite)+ 未声明 type 跳过类型检查", async () => {
+    const issues = validateToolInput(bashV.inputSchema, { command: "ls", timeout: NaN });
+    assert.ok(issues.length === 1 && issues[0].field === "timeout", JSON.stringify(issues));
+    // 未声明 type 的属性(MCP anyOf 复杂形状)→ 只查 required, 不做类型检查
+    const schema = {
+      type: "object",
+      properties: { a: { type: "string" }, b: { anyOf: [{ type: "string" }, { type: "number" }] } },
+      required: ["a"],
+    };
+    assert.deepStrictEqual(validateToolInput(schema, { a: "ok", b: { complex: true } }), []);
+  });
+
+  await test("format: 未知字段提示 + 参数签名一次给全(模型单轮自修正)", async () => {
+    const s = new WriteTool().inputSchema;
+    const bad = { path: "/a", cotnent: "typo" }; // content 拼错 → 缺失 + 幻觉字段
+    const msg = formatValidationIssues("Write", s, bad, validateToolInput(s, bad));
+    assert.ok(msg.startsWith("工具输入校验失败(Write)"), msg);
+    assert.ok(msg.includes("content: 必填字段缺失"), msg);
+    assert.ok(msg.includes("cotnent") && msg.includes("未知字段"), msg);
+    assert.ok(msg.includes("path: string(必填)") && msg.includes("content: string(必填)"), msg);
+  });
+
+  // -- 语义修正: 空串/越界(形状合法但值无意义) --
+  await test("Bash: 空 command 报错(不再 bash -c '' 静默成功)", async () => {
+    const r = await bashV.execute({ command: "   " });
+    assert.ok(r.isError && r.content.includes("command 不能为空"), JSON.stringify(r));
+  });
+
+  await test("Bash: timeout 越界报错(0/负/超上限, 文案含合法区间)", async () => {
+    for (const t of [0, -5, 700000]) {
+      const r = await bashV.execute({ command: "echo hi", timeout: t });
+      assert.ok(r.isError && r.content.includes("1-600000"), JSON.stringify(r));
+    }
+  });
+
+  await test("Bash: 合法短 timeout 直调通过(不误伤既有中断测试)", async () => {
+    const r = await bashV.execute({ command: "echo ok", timeout: 1500 });
+    assert.ok(!r.isError && r.content.includes("ok"), JSON.stringify(r));
+  });
+
+  await test("Grep: max_results 非正整数报错(不再假'未找到匹配')", async () => {
+    const r = await grep.execute({ pattern: "x", path: dirV, max_results: -1 });
+    assert.ok(r.isError && r.content.includes("max_results"), JSON.stringify(r));
+  });
+
+  await test("Task: max_turns 越界报错(0/超上限/小数, 文案含区间)", async () => {
+    for (const m of [0, 51, 2.5]) {
+      const r = await taskV.execute({ description: "d", prompt: "p", max_turns: m });
+      assert.ok(r.isError && r.content.includes("1-50"), JSON.stringify(r));
+    }
+  });
+
+  await test("Write/Read: 空 path 明确报错(替换困惑的 ENOENT)", async () => {
+    const r1 = await write.execute({ path: "", content: "x" });
+    assert.ok(r1.isError && r1.content.includes("path 不能为空"), JSON.stringify(r1));
+    const r2 = await read.execute({ path: "" });
+    assert.ok(r2.isError && r2.content.includes("path 不能为空"), JSON.stringify(r2));
+  });
+
+  await test("Write: 直调缺 content 报错且不清空既有文件(数据丢失防线)", async () => {
+    const fKeep = path.join(dirV, "keep.txt");
+    fs.writeFileSync(fKeep, "KEEP ME\n", "utf8");
+    const r = await write.execute({ path: fKeep }); // 缺 content → 原实现会静默清空
+    assert.ok(r.isError && r.content.includes("content 必须为 string"), JSON.stringify(r));
+    assert.strictEqual(fs.readFileSync(fKeep, "utf8"), "KEEP ME\n", "文件未被清空");
+  });
+
+  await test("Edit: 直调缺 new_string 报错(不再静默删除); 显式空串仍是合法删除", async () => {
+    const fDel = path.join(dirV, "del.txt");
+    fs.writeFileSync(fDel, "alpha beta\n", "utf8");
+    await read.execute({ path: fDel });
+    const r1 = await edit.execute({ path: fDel, old_string: "alpha " }); // 缺 new_string → 原实现会删除匹配
+    assert.ok(r1.isError, JSON.stringify(r1));
+    assert.strictEqual(fs.readFileSync(fDel, "utf8"), "alpha beta\n", "内容未被删除");
+    const r2 = await edit.execute({ path: fDel, old_string: "beta", new_string: "" }); // 显式 "" = 删除语义
+    assert.ok(!r2.isError, JSON.stringify(r2));
+    assert.strictEqual(fs.readFileSync(fDel, "utf8"), "alpha \n");
+  });
+
+  // -- dispatch 集成: 校验先于权限瀑布, 计入 toolErrors(同未知工具口径) --
+  await test("dispatch: 坏输入 → isError tool_result, 不进瀑布不跑 PostToolUse, 计入遥测", async () => {
+    const { Telemetry } = require("../dist/telemetry/telemetry");
+    const telem = new Telemetry(dirV);
+    const fBad = path.join(dirV, "victim.txt");
+    fs.writeFileSync(fBad, "SAFE\n", "utf8");
+    const provider = new MockProvider([
+      { toolUses: [{ name: "Write", input: { path: fBad } }] },          // 缺 content → 校验失败
+      { toolUses: [{ name: "Bash", input: { command: "date" } }] },      // date 不在白名单 → 正常走弹窗
+      { text: "done" },
+    ]);
+    const tools = new ToolRegistry();
+    tools.register(new WriteTool());
+    tools.register(new BashTool());
+    const noHooks = new HookRunner(parseHookSettings({}), dirV, () => {});
+    const sessInfo = { sessionId: "sv", transcriptPath: path.join(dirV, "t.jsonl"), cwd: dirV };
+    let permCalls = 0;
+    const deps = {
+      provider,
+      tools,
+      permissions: new PermissionEngine({
+        rules: { allow: [], deny: [], ask: [] },
+        hooks: noHooks,
+        provider,
+        mode: "default",
+        userResponder: async () => {
+          permCalls++;
+          return "yes";
+        },
+        session: sessInfo,
+        log: () => {},
+      }),
+      hooks: noHooks,
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: ["test"],
+      systemTokens: 1,
+      model: "m",
+      artifactsDir: dirV,
+      session: sessInfo,
+      getUserMessages: () => [],
+      telemetry: telem,
+      log: () => {},
+    };
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    await runQuery(deps, state, "user");
+    // 坏 Write 被校验拦截: 文件不被清空; 若进了瀑布, Write 静态不放行必弹窗(permCalls 会是 2)
+    assert.strictEqual(fs.readFileSync(fBad, "utf8"), "SAFE\n", "校验失败不执行, 文件未被清空");
+    assert.strictEqual(permCalls, 1, "仅合法 Bash(date) 弹窗一次(坏输入未触发弹窗)");
+    assert.strictEqual(telem.errorStats.toolErrors, 1, "校验失败计入 toolErrors(同未知工具口径)");
+    // 消息树: 第一个 tool_result 为校验错误文案(模型可自修正), 第二个为正常输出
+    const trs = state.messages
+      .filter((m) => m.role === "user")
+      .flatMap((m) => m.content)
+      .filter((b) => b.type === "tool_result");
+    assert.ok(trs[0].is_error && trs[0].content.includes("工具输入校验失败(Write)") && trs[0].content.includes("必填"), JSON.stringify(trs[0]));
+    assert.ok(!trs[1].is_error && trs[1].content, "date 正常执行");
+    fs.rmSync(dirV, { recursive: true, force: true });
+  });
+
+  // ---------- Part 11: settings 分层合并(user → project → local)+ 系统提示定制 ----------
+  console.log("[11] settings 分层合并");
+  const dirS = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-settings-"));
+
+  await test("mergeSettings: 权限规则并集 + mcpServers 按键整体覆盖(异名并集)", async () => {
+    const m = mergeSettings([
+      {
+        path: "user",
+        raw: {
+          permissions: { allow: ["Read"], deny: ["Bash(rm:*)"] },
+          mcpServers: { echo: { command: "node", args: ["a.js"] }, extra: { command: "x" } },
+        },
+      },
+      { path: "project", raw: { permissions: { allow: ["Bash(ls:*)"], ask: ["Write"] }, mcpServers: { echo: { command: "bun" } } } },
+      { path: "local", raw: { permissions: { deny: ["Bash(curl:*)"] } } },
+    ]);
+    assert.deepStrictEqual(m.rules, { allow: ["Read", "Bash(ls:*)"], deny: ["Bash(rm:*)", "Bash(curl:*)"], ask: ["Write"] });
+    assert.deepStrictEqual(m.mcpServers, { echo: { command: "bun" }, extra: { command: "x" } }); // 同名深层整体替换
+  });
+
+  await test("mergeSettings: engine/model 标量深层覆盖(undefined 不覆盖)", async () => {
+    const m = mergeSettings([
+      { path: "user", raw: { engine: { maxTurns: 100, tokenBudget: 1000 }, model: "m-user" } },
+      { path: "project", raw: { engine: { maxTurns: 50 } } },
+      { path: "local", raw: {} },
+    ]);
+    assert.deepStrictEqual(m.engine, { maxTurns: 50, tokenBudget: 1000 });
+    assert.strictEqual(m.model, "m-user");
+  });
+
+  await test("mergeSettings: systemPromptAppend 各层拼接 + composeSystemPrompt 组装序(模式后缀永远最后)", async () => {
+    const m = mergeSettings([
+      { path: "user", raw: { systemPromptAppend: "用户偏好" } },
+      { path: "project", raw: { systemPromptAppend: "项目上下文" } },
+      { path: "local", raw: { systemPromptAppend: "本地临时" } },
+    ]);
+    assert.strictEqual(m.systemPromptAppend, "用户偏好\n\n项目上下文\n\n本地临时");
+    const prompt = composeSystemPrompt("BASE", m, { cliAppend: "CLI 追加", modeSuffix: "Plan 模式" });
+    assert.strictEqual(prompt, "BASE\n\n用户偏好\n\n项目上下文\n\n本地临时\n\nCLI 追加\n\nPlan 模式");
+    assert.strictEqual(composeSystemPrompt("BASE", { systemPromptAppend: "" }), "BASE"); // 无追加段 → 原样基线
+  });
+
+  await test("mergeSettings: hooks 按事件键连接(user 先注册先执行)", async () => {
+    const m = mergeSettings([
+      { path: "user", raw: { hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "u.sh" }] }] } } },
+      {
+        path: "project",
+        raw: {
+          hooks: {
+            PreToolUse: [{ hooks: [{ type: "command", command: "p.sh" }] }],
+            Stop: [{ hooks: [{ type: "command", command: "s.sh" }] }],
+          },
+        },
+      },
+    ]);
+    assert.deepStrictEqual(m.hookSettings, {
+      PreToolUse: [
+        { hooks: [{ type: "command", command: "u.sh" }] },
+        { hooks: [{ type: "command", command: "p.sh" }] },
+      ],
+      Stop: [{ hooks: [{ type: "command", command: "s.sh" }] }],
+    });
+  });
+
+  await test("mergeSettings: 字段级降级 — 类型错字段忽略+警告, 同层其余字段照常", async () => {
+    const m = mergeSettings([
+      {
+        path: "bad",
+        raw: {
+          permissions: "x",
+          mcpServers: { echo: "not-object" },
+          engine: { maxTurns: -5, tokenBudget: "大" },
+          model: 42,
+          systemPromptAppend: "存活",
+        },
+      },
+    ]);
+    assert.deepStrictEqual(m.rules, { allow: [], deny: [], ask: [] });
+    assert.deepStrictEqual(m.mcpServers, {});
+    assert.deepStrictEqual(m.engine, {});
+    assert.strictEqual(m.model, undefined);
+    assert.strictEqual(m.systemPromptAppend, "存活");
+    const w = m.layers[0].warnings.join("\n");
+    assert.ok(
+      w.includes("permissions") && w.includes("mcpServers.echo") && w.includes("engine.maxTurns") &&
+        w.includes("engine.tokenBudget") && w.includes("model"),
+      w
+    );
+  });
+
+  await test("mergeSettings: 未知顶层字段警告(前向兼容不拒绝)", async () => {
+    const m = mergeSettings([{ path: "u", raw: { futureFeature: true, model: "m" } }]);
+    assert.strictEqual(m.model, "m");
+    assert.ok(m.layers[0].warnings.some((x) => x.includes("futureFeature")));
+  });
+
+  await test("loadMergedSettings: AGENT_HARNESS_HOME 重定向 + JSON 坏整层跳过 + 其余层照常", async () => {
+    const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-user-"));
+    const projRoot = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-proj-"));
+    fs.writeFileSync(path.join(userDir, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(date:*)"] }, systemPromptAppend: "用户级追加" }));
+    fs.mkdirSync(path.join(projRoot, "demo"), { recursive: true });
+    fs.writeFileSync(path.join(projRoot, "demo", "settings.json"), "{broken json");
+    fs.mkdirSync(path.join(projRoot, ".agent-harness"), { recursive: true });
+    fs.writeFileSync(path.join(projRoot, ".agent-harness", "settings.json"), JSON.stringify({ model: "local-model", engine: { maxTurns: 50 } }));
+    const savedHome = process.env.AGENT_HARNESS_HOME;
+    process.env.AGENT_HARNESS_HOME = userDir;
+    try {
+      // 数组序即合并序(user → project → local); env AGENT_HARNESS_HOME 优先于 ~
+      assert.deepStrictEqual(resolveLayerPaths({ projectRoot: projRoot }), [
+        path.join(userDir, "settings.json"),
+        path.join(projRoot, "demo", "settings.json"),
+        path.join(projRoot, ".agent-harness", "settings.json"),
+      ]);
+      const lines = [];
+      const m = loadMergedSettings({ projectRoot: projRoot, log: (l) => lines.push(l) });
+      assert.deepStrictEqual(m.rules, { allow: ["Bash(date:*)"], deny: [], ask: [] }); // user 层规则生效
+      assert.strictEqual(m.model, "local-model"); // local 层覆盖
+      assert.strictEqual(m.engine.maxTurns, 50);
+      assert.strictEqual(m.systemPromptAppend, "用户级追加");
+      const proj = m.layers[1]; // project 层: JSON 坏 → 整层跳过 + 警告
+      assert.strictEqual(proj.loaded, false);
+      assert.ok(proj.warnings.some((x) => x.includes("JSON 解析失败")), JSON.stringify(proj));
+      assert.ok(lines.some((l) => l.includes("JSON 解析失败")), "坏层警告经 log 外发");
+    } finally {
+      if (savedHome === undefined) delete process.env.AGENT_HARNESS_HOME;
+      else process.env.AGENT_HARNESS_HOME = savedHome;
+      fs.rmSync(userDir, { recursive: true, force: true });
+      fs.rmSync(projRoot, { recursive: true, force: true });
+    }
+  });
+
+  await test("loadMergedSettings: 全部层缺失 → 空默认 + 一行提示(不再 throw)", async () => {
+    const lines = [];
+    const m = loadMergedSettings({ userDir: path.join(dirS, "none"), projectRoot: path.join(dirS, "none2"), log: (l) => lines.push(l) });
+    assert.deepStrictEqual(m.rules, { allow: [], deny: [], ask: [] });
+    assert.deepStrictEqual(m.mcpServers, {});
+    assert.strictEqual(m.systemPromptAppend, "");
+    assert.ok(lines.some((l) => l.includes("未发现任何 settings")), lines.join("\n"));
+  });
+
+  await test("resolveModel: 解析序 env > settings > 内置默认", async () => {
+    const saved = process.env.ANTHROPIC_MODEL;
+    try {
+      process.env.ANTHROPIC_MODEL = "env-model";
+      assert.strictEqual(resolveModel({ model: "s-model" }), "env-model");
+      delete process.env.ANTHROPIC_MODEL;
+      assert.strictEqual(resolveModel({ model: "s-model" }), "s-model");
+      assert.strictEqual(resolveModel({}), "claude-sonnet-4-5");
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_MODEL;
+      else process.env.ANTHROPIC_MODEL = saved;
+    }
+  });
+
+  // ---------- Part 12: Slash 命令 + 权限模式运行中切换 ----------
+  console.log("[12] Slash 命令 + 模式运行中切换");
+
+  // 命令注册表(纯函数层): fake ctx 收集输出与 setMode 调用
+  const mkCmdCtx = (mode = "default") => {
+    const out = [];
+    const ctx = {
+      mode,
+      setModeCalls: [],
+      getMode: () => ctx.mode,
+      setMode: (m) => {
+        ctx.setModeCalls.push(m);
+        ctx.mode = m;
+      },
+      status: () => `[status] fake ${ctx.mode}`,
+      permissionsSummary: () => "[permissions] fake",
+      log: (l) => out.push(l),
+      exit: () => out.push("EXIT"),
+    };
+    return { ctx, out };
+  };
+
+  await test("dispatchSlashCommand: 非命令 → false;未知命令拦截报错(不转发 LLM);/exit 走 exit()", async () => {
+    const { ctx, out } = mkCmdCtx();
+    assert.strictEqual(dispatchSlashCommand("普通消息", ctx), false);
+    assert.strictEqual(dispatchSlashCommand("/exit", ctx), true);
+    assert.deepStrictEqual(out, ["EXIT"]);
+    const { ctx: c2, out: o2 } = mkCmdCtx();
+    assert.strictEqual(dispatchSlashCommand("/nope x", c2), true);
+    assert.strictEqual(o2.length, 1);
+    assert.ok(o2[0].includes("未知命令") && o2[0].includes("/help"), o2[0]);
+  });
+
+  await test("/help 列出 5 命令;/status /permissions 输出经 ctx 回流", async () => {
+    const { ctx, out } = mkCmdCtx();
+    dispatchSlashCommand("/help", ctx);
+    const helpText = out.join("\n");
+    for (const name of ["help", "status", "mode", "permissions", "exit"]) {
+      assert.ok(helpText.includes(`/${name}`), `缺少 /${name}`);
+    }
+    dispatchSlashCommand("/status", ctx);
+    assert.ok(out.some((l) => l.includes("fake default")));
+    dispatchSlashCommand("/permissions", ctx);
+    assert.ok(out.some((l) => l.includes("[permissions]")));
+  });
+
+  await test("/mode: 无参显示当前;非法参数报错;bypassPermissions 需 --dangerous;多空格容错", async () => {
+    const { ctx, out } = mkCmdCtx("auto");
+    dispatchSlashCommand("/mode", ctx);
+    assert.ok(out.some((l) => l.includes("当前: auto") && l.includes("bypassPermissions")), out.join("\n"));
+    dispatchSlashCommand("/mode fast", ctx);
+    assert.ok(out.some((l) => l.includes("未知模式")), out.join("\n"));
+    dispatchSlashCommand("/mode bypassPermissions", ctx); // 无 --dangerous → 拒绝
+    assert.deepStrictEqual(ctx.setModeCalls, []);
+    assert.ok(out.some((l) => l.includes("--dangerous")));
+    dispatchSlashCommand("/mode bypassPermissions --dangerous", ctx);
+    assert.deepStrictEqual(ctx.setModeCalls, ["bypassPermissions"]);
+    dispatchSlashCommand("/mode   plan  ", ctx); // 多空格 + 尾随空格容错
+    assert.deepStrictEqual(ctx.setModeCalls, ["bypassPermissions", "plan"]);
+  });
+
+  await test("updateMode: plan 门禁即时生效 + 切回 default 恢复弹窗(不弹窗的切换无感)", async () => {
+    const dir12 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mode-"));
+    let asked = 0;
+    const eng = new PermissionEngine({
+      rules: { allow: [], deny: [], ask: [] },
+      hooks: new HookRunner(parseHookSettings({}), dir12, () => {}),
+      provider: new MockProvider([]),
+      mode: "default",
+      userResponder: async () => {
+        asked++;
+        return "no";
+      },
+      session: { sessionId: "s", transcriptPath: "/dev/null", cwd: dir12 },
+      log: () => {},
+    });
+    const edit12 = new EditTool();
+    const args12 = { path: path.join(dir12, "x"), old_string: "a", new_string: "b" };
+    const r1 = await eng.check(edit12, args12, []); // default → 兜底弹窗
+    assert.strictEqual(r1.source, "user");
+    assert.strictEqual(asked, 1);
+    eng.updateMode("plan"); // 切 plan → 同操作立即被门禁拒(不弹窗)
+    const r2 = await eng.check(edit12, args12, []);
+    assert.strictEqual(r2.decision, "deny");
+    assert.strictEqual(r2.source, "plan-mode");
+    assert.strictEqual(asked, 1);
+    eng.updateMode("default"); // 切回 → 恢复弹窗
+    const r3 = await eng.check(edit12, args12, []);
+    assert.strictEqual(r3.source, "user");
+    assert.strictEqual(asked, 2);
+    assert.strictEqual(eng.mode, "default"); // 只读访问器
+    fs.rmSync(dir12, { recursive: true, force: true });
+  });
+
+  await test("updateMode 不清洗会话记忆 + ruleCounts/sessionAllowCount 访问器", async () => {
+    const dir12 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-mode-"));
+    let n = 0;
+    const eng = new PermissionEngine({
+      rules: { allow: [], deny: [], ask: [] },
+      hooks: new HookRunner(parseHookSettings({}), dir12, () => {}),
+      provider: new MockProvider([]),
+      mode: "default",
+      userResponder: async () => (++n === 1 ? "always" : "no"),
+      session: { sessionId: "s", transcriptPath: "/dev/null", cwd: dir12 },
+      log: () => {},
+    });
+    const bash12 = new BashTool();
+    const b1 = await eng.check(bash12, { command: "git push origin main" }, []); // 弹窗 always → 记住
+    assert.strictEqual(b1.source, "user");
+    eng.updateMode("auto"); // 切 auto → 同前缀命令命中会话记忆层(先于分类器)
+    const b2 = await eng.check(bash12, { command: "git push origin x" }, []);
+    assert.strictEqual(b2.source, "session-allow");
+    assert.strictEqual(eng.sessionAllowCount, 1);
+    assert.deepStrictEqual(eng.ruleCounts, { allow: 0, deny: 0, ask: 0 });
+    eng.updateRules({ allow: ["Read"], deny: ["Bash(rm:*)"], ask: ["Write"] }); // 热加载后计数实时
+    assert.deepStrictEqual(eng.ruleCounts, { allow: 1, deny: 1, ask: 1 });
+    fs.rmSync(dir12, { recursive: true, force: true });
+  });
+
+  await test("setMode: plan 后缀动态增删 + systemTokens 重算 + mode_changed 事件(双通道即时)", async () => {
+    const emitted = [];
+    const sid = `sess_smoke_cmd_${Date.now()}`;
+    const session = await createSession({
+      provider: new MockProvider([]),
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: "BASE-PROMPT",
+      rules: { allow: [], deny: [], ask: [] },
+      hookSettings: parseHookSettings({}),
+      sessionId: sid,
+      mode: "default",
+      emit: (e) => emitted.push(e),
+      userResponder: async () => "no",
+    });
+    try {
+      assert.ok(!session.deps.systemPrompt[0].includes(PLAN_MODE_SUFFIX), "初始 default 无后缀");
+      const baseTokens = session.deps.systemTokens;
+      session.setMode("plan"); // 切 plan: 后缀出现 + tokens 重算 + 事件
+      assert.strictEqual(session.deps.permissions.mode, "plan");
+      const withSuffix = session.deps.systemPrompt[0];
+      assert.ok(withSuffix.includes("BASE-PROMPT") && withSuffix.includes(PLAN_MODE_SUFFIX), withSuffix);
+      assert.strictEqual(session.deps.systemTokens, estimateTokens(withSuffix));
+      assert.ok(session.deps.systemTokens > baseTokens, "后缀令牌计入水位");
+      assert.ok(emitted.some((e) => e.kind === "mode_changed" && e.mode === "plan"));
+      session.setMode("auto"); // 切走: 后缀动态移除(不残留误导模型)
+      assert.ok(!session.deps.systemPrompt[0].includes(PLAN_MODE_SUFFIX));
+      assert.strictEqual(session.deps.systemTokens, baseTokens);
+      assert.ok(emitted.some((e) => e.kind === "mode_changed" && e.mode === "auto"));
+    } finally {
+      session.close();
+      try {
+        fs.rmSync(path.join(SESSIONS_DIR, `${sid}.jsonl`), { force: true });
+      } catch { /* 空 transcript 可能未落盘 */ }
+    }
+  });
+
+  await test("createSession(mode plan): 创建即含后缀(启动 --plan 与运行中切换同源)", async () => {
+    const sid = `sess_smoke_cmd_p_${Date.now()}`;
+    const session = await createSession({
+      provider: new MockProvider([]),
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: "BASE-PROMPT",
+      rules: { allow: [], deny: [], ask: [] },
+      hookSettings: parseHookSettings({}),
+      sessionId: sid,
+      mode: "plan",
+      userResponder: async () => "no",
+    });
+    try {
+      assert.strictEqual(session.deps.permissions.mode, "plan");
+      assert.ok(session.deps.systemPrompt[0].endsWith(PLAN_MODE_SUFFIX), "后缀拼在提示尾部");
+      assert.strictEqual(session.deps.systemTokens, estimateTokens(session.deps.systemPrompt[0]));
+    } finally {
+      session.close();
+      try {
+        fs.rmSync(path.join(SESSIONS_DIR, `${sid}.jsonl`), { force: true });
+      } catch { /* 同上 */ }
+    }
+  });
+
+  // ---------- Part 13: Headless 非交互单发(chat -p / stdin 管道 / --output-format) ----------
+  //     子进程 spawn + AGENT_HARNESS_MOCK_SCRIPT 显式 mock(防真实 Keychain/用户级 settings 介入:
+  //     ANTHROPIC_API_KEY 置空 + NO_KEYCHAIN + AGENT_HARNESS_HOME 指向空临时目录)
+  console.log("[13] Headless 非交互单发(chat -p / stdin / output-format)");
+  const headlessHome = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-headless-home-"));
+  const HEADLESS_ENV = {
+    ...process.env,
+    ANTHROPIC_API_KEY: "",
+    AGENT_HARNESS_NO_KEYCHAIN: "1",
+    AGENT_HARNESS_HOME: headlessHome,
+  };
+  // keepTranscript: 测试需读 transcript 断言时置 true(跳过自动清理, 由测试方 rmTranscript 收尾)
+  const headlessRun = (cliArgs, { stdinData, mockScript, keepTranscript } = {}) =>
+    new Promise((resolve) => {
+      const env = { ...HEADLESS_ENV };
+      if (mockScript !== undefined) env.AGENT_HARNESS_MOCK_SCRIPT = JSON.stringify(mockScript);
+      // 快照 sessions 目录: 结束后清掉本次 spawn 新建的 sess_chat_*(text 格式拿不到 sessionId, 统一差异清理
+      //   防污染开发者 chat --resume 会话列表; smoke 自身会话用 sess_smoke_* 前缀不受影响)
+      const before = new Set(fs.existsSync(SESSIONS_DIR) ? fs.readdirSync(SESSIONS_DIR) : []);
+      const child = spawn("node", ["dist/cli.js", "chat", ...cliArgs], {
+        cwd: path.resolve(__dirname, ".."),
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (d) => (out += d.toString()));
+      child.stderr.on("data", (d) => (err += d.toString()));
+      child.stdin.end(stdinData);
+      const cleanup = () => {
+        if (keepTranscript || !fs.existsSync(SESSIONS_DIR)) return;
+        for (const f of fs.readdirSync(SESSIONS_DIR)) {
+          if (!before.has(f) && f.startsWith("sess_chat_")) {
+            fs.rmSync(path.join(SESSIONS_DIR, f), { force: true });
+          }
+        }
+      };
+      child.on("error", (e) => {
+        cleanup();
+        resolve({ code: -1, out, err: err + String(e) });
+      });
+      child.on("close", (code) => {
+        cleanup();
+        resolve({ code, out, err });
+      });
+    });
+  const rmTranscript = (sid) => {
+    try {
+      fs.rmSync(path.join(SESSIONS_DIR, `${sid}.jsonl`), { force: true });
+    } catch { /* 空 transcript 可能未落盘 */ }
+  };
+
+  await test("chat -p 基本链路: 白名单工具放行 → stdout 仅最终文本(日志走 stderr), exit 0", async () => {
+    const r = await headlessRun(["-p", "看下目录"], {
+      mockScript: [
+        { toolUses: [{ name: "Bash", input: { command: "ls -la" } }] },
+        { text: "HEADLESS-BASIC-DONE 目录已查看。" },
+      ],
+    });
+    assert.strictEqual(r.code, 0, `stderr: ${r.err}`);
+    assert.ok(r.out.includes("HEADLESS-BASIC-DONE"), `stdout: ${r.out}`);
+    assert.ok(!r.out.includes("── 用户:"), "stdout 不应混入会话日志");
+    assert.ok(r.err.includes("── 用户:"), "进度日志应走 stderr");
+    assert.ok(!r.err.includes("自动拒绝"), "白名单工具不应触发自动拒绝");
+  });
+
+  await test("无人值守权限: 未命中规则 → 自动拒绝(模型收到拒绝反馈换路继续), exit 0", async () => {
+    const r = await headlessRun(["-p", "看下时间", "--permission-mode", "default"], {
+      mockScript: [
+        { toolUses: [{ name: "Bash", input: { command: "date" } }] },
+        { text: "HEADLESS-DENY-DONE 被拒后改由自身知识回答。" },
+      ],
+    });
+    assert.strictEqual(r.code, 0, `stderr: ${r.err}`);
+    assert.ok(r.err.includes("[headless] 权限弹窗自动拒绝"), `stderr: ${r.err}`);
+    assert.ok(r.err.includes("date"), `stderr: ${r.err}`);
+    assert.ok(r.out.includes("HEADLESS-DENY-DONE"), `stdout: ${r.out}`);
+  });
+
+  await test("--output-format json: stdout 单行 JSON, 含 result + 全量统计字段", async () => {
+    const r = await headlessRun(["-p", "你好", "--output-format", "json"], {
+      mockScript: [{ text: "JSON-RESULT-OK" }],
+    });
+    assert.strictEqual(r.code, 0, `stderr: ${r.err}`);
+    const lines = r.out.trim().split("\n");
+    assert.strictEqual(lines.length, 1, `stdout 应为单行 JSON: ${r.out}`);
+    const j = JSON.parse(lines[0]);
+    assert.strictEqual(j.result, "JSON-RESULT-OK");
+    assert.ok(j.sessionId.startsWith("sess_chat_"), j.sessionId); // 交互 chat --resume 可续接
+    assert.strictEqual(j.mode, "auto");
+    assert.strictEqual(j.permissionDenials, 0);
+    assert.strictEqual(j.toolUses, 0);
+    assert.strictEqual(j.interrupted, false);
+    assert.strictEqual(j.errors, 0);
+    assert.ok(typeof j.turns === "number" && j.turns >= 1, `turns: ${j.turns}`);
+    assert.ok(typeof j.totalTokensUsed === "number");
+    rmTranscript(j.sessionId);
+  });
+
+  await test("--output-format stream-json: UiEvent 逐行 JSONL + 终行 result 统计", async () => {
+    const r = await headlessRun(
+      ["-p", "看下时间", "--permission-mode", "default", "--output-format", "stream-json"],
+      {
+        mockScript: [
+          { toolUses: [{ name: "Bash", input: { command: "date" } }] },
+          { text: "STREAM-JSON-DONE" },
+        ],
+      }
+    );
+    assert.strictEqual(r.code, 0, `stderr: ${r.err}`);
+    const evs = r.out.trim().split("\n").map((l) => JSON.parse(l));
+    const kinds = new Set(evs.map((e) => e.kind));
+    for (const k of ["tool_start", "perm", "tool_result", "assistant_message", "stop", "result"]) {
+      assert.ok(kinds.has(k), `缺少事件 ${k}: ${r.out}`);
+    }
+    const perm = evs.find((e) => e.kind === "perm");
+    assert.strictEqual(perm.decision, "deny");
+    assert.strictEqual(perm.source, "user");
+    const tr = evs.find((e) => e.kind === "tool_result");
+    assert.strictEqual(tr.isError, true, "自动拒绝 → error tool_result");
+    const res = evs[evs.length - 1];
+    assert.strictEqual(res.kind, "result", "终行应为 result");
+    assert.strictEqual(res.result, "STREAM-JSON-DONE");
+    assert.strictEqual(res.permissionDenials, 1);
+    rmTranscript(res.sessionId);
+  });
+
+  await test("stdin 附加语义: cat x | chat -p '总结' → prompt = query + stdin 附加上下文", async () => {
+    const r = await headlessRun(["-p", "总结这个输入", "--output-format", "json"], {
+      stdinData: "LOG-LINE-A\nLOG-LINE-B\n",
+      mockScript: [{ text: "APPEND-OK" }],
+      keepTranscript: true,
+    });
+    assert.strictEqual(r.code, 0, `stderr: ${r.err}`);
+    const j = JSON.parse(r.out.trim());
+    const entries = fs
+      .readFileSync(path.join(SESSIONS_DIR, `${j.sessionId}.jsonl`), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    const userEntry = entries.find((e) => e.role === "user");
+    assert.ok(userEntry.content[0].text.includes("总结这个输入"), userEntry.content[0].text);
+    assert.ok(userEntry.content[0].text.includes("--- stdin 附加内容 ---"), userEntry.content[0].text);
+    assert.ok(userEntry.content[0].text.includes("LOG-LINE-A"), userEntry.content[0].text);
+    rmTranscript(j.sessionId);
+  });
+
+  await test("纯 stdin 提示词: cat x | chat(无 -p) → stdin 全文即提示词", async () => {
+    const r = await headlessRun(["--output-format", "json"], {
+      stdinData: "直接作为提示词的输入",
+      mockScript: [{ text: "STDIN-ONLY-OK" }],
+      keepTranscript: true,
+    });
+    assert.strictEqual(r.code, 0, `stderr: ${r.err}`);
+    const j = JSON.parse(r.out.trim());
+    assert.strictEqual(j.result, "STDIN-ONLY-OK");
+    const entries = fs
+      .readFileSync(path.join(SESSIONS_DIR, `${j.sessionId}.jsonl`), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    const userEntry = entries.find((e) => e.role === "user");
+    assert.strictEqual(userEntry.content[0].text, "直接作为提示词的输入");
+    rmTranscript(j.sessionId);
+  });
+
+  await test("--permission-mode plan: Write 被 plan 门禁拒绝(先于弹窗层 → permissionDenials 不计)", async () => {
+    const r = await headlessRun(["-p", "写个文件", "--permission-mode", "plan", "--output-format", "json"], {
+      mockScript: [
+        { toolUses: [{ name: "Write", input: { path: "/tmp/smoke-plan-x", content: "x" } }] },
+        { text: "PLAN-MODE-DONE 只读模式无法写入。" },
+      ],
+    });
+    assert.strictEqual(r.code, 0, `stderr: ${r.err}`);
+    const j = JSON.parse(r.out.trim());
+    assert.strictEqual(j.mode, "plan");
+    assert.ok(j.result.includes("PLAN-MODE-DONE"), `result: ${j.result}`);
+    assert.strictEqual(j.permissionDenials, 0, "plan 门禁在弹窗层之前, 不计入自动拒绝");
+    assert.strictEqual(j.toolUses, 1);
+    rmTranscript(j.sessionId);
+  });
+
+  await test("exit 1 系统故障: 无 key 无 mock → 报错; --output-format 非法值 → 参数错误", async () => {
+    const noKey = await headlessRun(["-p", "hi"]); // env 无 key + 禁 Keychain + 无 mock
+    assert.strictEqual(noKey.code, 1);
+    assert.ok(noKey.err.includes("headless 需要 API key"), noKey.err);
+    const badFmt = await headlessRun(["-p", "hi", "--output-format", "yaml"], {
+      mockScript: [{ text: "x" }],
+    });
+    assert.strictEqual(badFmt.code, 1);
+    assert.ok(badFmt.err.includes("--output-format 非法"), badFmt.err);
+  });
+
+  fs.rmSync(headlessHome, { recursive: true, force: true });
+
+  fs.rmSync(dirS, { recursive: true, force: true });
   fs.rmSync(dir, { recursive: true, force: true });
   console.log(`\n冒烟测试全部通过 (${passed}/${passed})`);
 })().catch((e) => {

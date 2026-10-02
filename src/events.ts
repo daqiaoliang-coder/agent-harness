@@ -1,6 +1,7 @@
 // 结构化 UI 事件总线 — 引擎(query.ts/engine.ts)与前端(CLI/Web)之间的解耦层。
 // 参考原版架构: 其 UI 渲染内嵌在主循环; 这里改为类型化事件外发, CLI 与 Web 前端均作为订阅方。
 import { Message } from "./types";
+import { PermissionPreview } from "./permissions/preview";
 
 export type UiEvent =
   // 会话元信息(SSE 连接建立 / 新建 / resume 后广播)
@@ -16,10 +17,23 @@ export type UiEvent =
   | { kind: "tool_start"; id: string; name: string; input: Record<string, unknown> }
   | { kind: "tool_result"; id: string; name: string; output: string; isError: boolean }
   // 权限弹窗(Web userResponder 桥接: 请求 → 浏览器渲染 → HTTP 应答 → resolve)
-  | { kind: "permission_request"; id: string; toolName: string; reason: string; input: Record<string, unknown> }
-  | { kind: "permission_resolved"; id: string; answer: "yes" | "no" }
+  //   preview: Edit/Write diff 预览(无则前端回落 JSON); alwaysRule: 选"总是允许"将记住的会话规则
+  | {
+      kind: "permission_request";
+      id: string;
+      toolName: string;
+      reason: string;
+      input: Record<string, unknown>;
+      preview?: PermissionPreview;
+      alwaysRule?: string;
+    }
+  | { kind: "permission_resolved"; id: string; answer: "yes" | "no" | "always" }
   // 权限瀑布判决(遥测; UI 在工具卡片上标注来源)
   | { kind: "perm"; id: string; decision: string; source: string; reason: string }
+  // Slash 命令输出("/" 开头被命令注册表拦截, 不发给 LLM; 前端渲染为系统行)
+  | { kind: "command_output"; text: string }
+  // 运行中权限模式切换(/mode 或 Web 徽章下拉; 前端同步徽章, 多标签页一致)
+  | { kind: "mode_changed"; mode: string }
   // 压缩管线触发(T0-T5)
   | { kind: "compact"; level: string; detail: string }
   // 引擎日志行(水位/usage/cache 等; 前端默认折叠)

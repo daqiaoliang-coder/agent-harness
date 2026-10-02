@@ -23,13 +23,22 @@ export class WriteTool implements Tool {
   }
 
   async execute(input: Record<string, unknown>): Promise<ToolResult> {
+    const p = String(input.path ?? "");
+    if (!p) return { content: "参数错误: path 不能为空", isError: true };
+    // 直调防线: content 缺失/非 string → 拒绝。String(undefined) 转空串曾静默清空已存在文件;
+    // 显式 content: "" 仍合法(= truncate 意图), "缺失"与"空"必须区分
+    const content = input.content;
+    if (typeof content !== "string") {
+      return {
+        content: `参数错误: content 必须为 string(收到 ${content === undefined ? "undefined" : typeof content})`,
+        isError: true,
+      };
+    }
     // 文件级互斥: 与并行 Edit/Write 串行(防整写覆盖丢失编辑)
-    return withFileLock(path.resolve(String(input.path ?? "")), () => this.run(input));
+    return withFileLock(path.resolve(p), () => this.run(p, content));
   }
 
-  private async run(input: Record<string, unknown>): Promise<ToolResult> {
-    const p = String(input.path ?? "");
-    const content = String(input.content ?? "");
+  private async run(p: string, content: string): Promise<ToolResult> {
     try {
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, content, "utf8");

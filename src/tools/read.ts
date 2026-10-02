@@ -24,6 +24,7 @@ export class ReadTool implements Tool {
 
   async execute(input: Record<string, unknown>): Promise<ToolResult> {
     const p = String(input.path ?? "");
+    if (!p) return { content: "参数错误: path 不能为空", isError: true };
     try {
       const content = fs.readFileSync(p, "utf8");
       markRead(p); // 记录快照(mtime+size), 供 Edit 做先读后改/新鲜度校验

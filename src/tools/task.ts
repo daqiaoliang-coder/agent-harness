@@ -6,6 +6,8 @@ import { Tool, ToolContext } from "./tool";
 // signal: 父级中断信号 → 透传给子代理主循环(中断传播)
 export type SpawnAgent = (prompt: string, maxTurns?: number, signal?: AbortSignal) => Promise<string>;
 
+const MAX_SUB_TURNS = 50; // 子代理轮次上界(防失控; 原为 Math.min 内联, 现显式报错)
+
 export class TaskTool implements Tool {
   readonly name = "Task";
   readonly description =
@@ -30,7 +32,19 @@ export class TaskTool implements Tool {
   async execute(input: Record<string, unknown>, ctx?: ToolContext): Promise<ToolResult> {
     const prompt = String(input.prompt ?? "");
     if (!prompt) return { content: "参数错误: 需要 prompt(给子代理的完整任务指令)", isError: true };
-    const maxTurns = Math.min(Number(input.max_turns ?? 12) || 12, 50);
+    // max_turns: 调度层 validator 已保证 number; 此处直调保险 + 越界报错而非 clamp
+    // (负数曾静默变成 0 轮 → 子代理抛困惑的"超过最大轮次守卫(-5 轮)")
+    const rawMaxTurns = input.max_turns;
+    if (rawMaxTurns !== undefined && rawMaxTurns !== null) {
+      const n = Number(rawMaxTurns);
+      if (!Number.isInteger(n) || n < 1 || n > MAX_SUB_TURNS) {
+        return {
+          content: `参数错误: max_turns 须为 1-${MAX_SUB_TURNS} 的整数(收到 ${JSON.stringify(rawMaxTurns)})`,
+          isError: true,
+        };
+      }
+    }
+    const maxTurns = rawMaxTurns !== undefined && rawMaxTurns !== null ? Number(rawMaxTurns) : 12;
     try {
       const report = await this.spawnAgent(prompt, maxTurns, ctx?.signal);
       return { content: report };

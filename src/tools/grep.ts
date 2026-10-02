@@ -40,7 +40,16 @@ export class GrepTool implements Tool {
     } catch (e) {
       return { content: `无效正则 ${JSON.stringify(pattern)}: ${(e as Error).message}`, isError: true };
     }
-    const maxResults = Math.min(Number(input.max_results ?? DEFAULT_MAX_RESULTS) || DEFAULT_MAX_RESULTS, 500);
+    // max_results: 调度层 validator 已保证 number; 此处直调保险 + 下界报错
+    // (负数曾让 `lines.length < -10` 恒 false → 假"未找到匹配"; 上界 500 维持展示截断 clamp)
+    let maxResults = DEFAULT_MAX_RESULTS;
+    if (input.max_results !== undefined && input.max_results !== null) {
+      const n = Number(input.max_results);
+      if (!Number.isInteger(n) || n < 1) {
+        return { content: `参数错误: max_results 须为 ≥1 的整数(收到 ${JSON.stringify(input.max_results)})`, isError: true };
+      }
+      maxResults = Math.min(n, 500);
+    }
     const globRe = input.glob ? globToRegex(String(input.glob)) : null;
 
     // 目标: 单文件(相对路径=basename) 或 目录遍历(相对路径相对 root; 可按 glob 过滤)
