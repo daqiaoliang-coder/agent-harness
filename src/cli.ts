@@ -534,6 +534,13 @@ async function runChat(): Promise<void> {
         `[permissions] 会话内"总是允许"记忆 ${p.sessionAllowCount} 条(仅本会话)`
       );
     },
+    usageSummary: () => {
+      const s = getTelemetry(PROJECT_ROOT).usageStats();
+      return (
+        `[usage] 最近 5h: ${s.calls} 次调用 | 总计 ${s.totals.total} tokens` +
+        `(in ${s.totals.input} / out ${s.totals.output} / cache_read ${s.totals.cacheRead} / cache_create ${s.totals.cacheCreate}) | 涉及 ${s.sessions} 个会话`
+      );
+    },
     log: (line) => log(line),
     exit: () => rl.close(),
   };

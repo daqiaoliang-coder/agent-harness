@@ -4,6 +4,7 @@
 //   GET  /api/sessions          → 会话列表(transcript *.jsonl)
 //   GET  /api/session/history   → 指定活动会话回放(?sessionId= → 消息树事件 + 挂起弹窗 + running 态)
 //   GET  /api/stats             → 错误遥测汇总(错误分类计数 + 活动会话轮次/token 用量)
+//   GET  /api/usage             → 用量仪表盘(5h 滚动窗口聚合 + 活动会话实时累计; /usage 命令同源)
 //   POST /api/message           → 发送用户消息({text, sessionId?}; 每会话独立串行队列 → 跨会话并发)
 //   POST /api/permission/:id    → 权限弹窗应答(resolve 挂起的 userResponder Promise)
 //   POST /api/abort             → 中断指定会话当前运行({sessionId?}; 仅冲洗目标会话的挂起弹窗)
@@ -175,6 +176,13 @@ const webCommandCtx = (live: Live): CommandContext => ({
     return (
       `[permissions] 分层合并后规则: allow ${c.allow} | deny ${c.deny} | ask ${c.ask}\n` +
       `[permissions] 会话内"总是允许"记忆 ${p.sessionAllowCount} 条(仅本会话)`
+    );
+  },
+  usageSummary: () => {
+    const s = getTelemetry(PROJECT_ROOT).usageStats();
+    return (
+      `[usage] 最近 5h: ${s.calls} 次调用 | 总计 ${s.totals.total} tokens` +
+      `(in ${s.totals.input} / out ${s.totals.output} / cache_read ${s.totals.cacheRead} / cache_create ${s.totals.cacheCreate}) | 涉及 ${s.sessions} 个会话`
     );
   },
   log: (line) => bus.emit(tagged(live.id, { kind: "command_output", text: line })),
@@ -424,6 +432,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         errors: t.sessionErrorCount(l.id),
       })),
       logFile: t.logFile,
+    });
+  }
+
+  // 用量仪表盘: 5h 滚动窗口聚合(usage.jsonl; /usage 命令同源) + 活动会话实时累计(前端 30s 轮询)
+  if (req.method === "GET" && url === "/api/usage") {
+    const t = getTelemetry(PROJECT_ROOT);
+    return json(res, 200, {
+      ...t.usageStats(),
+      liveSessions: [...liveSessions.values()].map((l) => ({
+        id: l.id,
+        turns: l.session.state.turnCount,
+        tokensUsed: l.session.state.totalTokensUsed,
+      })),
     });
   }
 

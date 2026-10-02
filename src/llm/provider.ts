@@ -2,6 +2,7 @@
 // 真实 prompt 为自然语言; mock 用 [[标记]] 路由侧查询(分类器/折叠/压缩摘要)
 import { ContentBlock, Message } from "../types";
 import { ToolSchema } from "../context/cacheBoundary";
+import { estimateTokens } from "../context/tokenEstimator";
 
 export interface CompleteOptions {
   maxTokens: number;
@@ -132,7 +133,17 @@ export class MockProvider implements LLMProvider {
       });
     });
     void opts;
-    return { message: { role: "assistant", content } };
+    // 合成 usage(estimateTokens 口径): mock 链路的用量仪表盘/5h 窗口/预算累计有数据可测;
+    // 侧查询(分类器/折叠/压缩摘要)不返回 usage — 与真实侧查询不进计费口径一致
+    return {
+      message: { role: "assistant", content },
+      usage: {
+        input_tokens: estimateTokens(sys + JSON.stringify(_messages)),
+        output_tokens: estimateTokens(JSON.stringify(content)),
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    };
   }
 
   private text(t: string): CompleteResult {

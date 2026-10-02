@@ -34,6 +34,15 @@ export type UiEvent =
   | { kind: "command_output"; text: string }
   // 运行中权限模式切换(/mode 或 Web 徽章下拉; 前端同步徽章, 多标签页一致)
   | { kind: "mode_changed"; mode: string }
+  // 用量遥测(每主循环轮一推, 轮入口快照): 上下文水位 + 会话累计 → 前端渲染 topbar 水位条
+  | {
+      kind: "usage";
+      turn: number;
+      bufferTokens: number;
+      totalTokensUsed: number;
+      tokenBudget?: number;
+      watermarks: { effectiveWindow: number; autoCompactAt: number; warningAt: number; blockingAt: number };
+    }
   // 压缩管线触发(T0-T5)
   | { kind: "compact"; level: string; detail: string }
   // 引擎日志行(水位/usage/cache 等; 前端默认折叠)

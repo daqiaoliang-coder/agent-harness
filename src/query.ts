@@ -217,6 +217,21 @@ export async function runQuery(
       `[loop] turn ${++state.turnCount} | buffer ${tokens} tokens ` +
       `(${((tokens / wm.effectiveWindow) * 100).toFixed(1)}% of effectiveWindow ${wm.effectiveWindow})`
     );
+    // 用量事件(轮入口快照): buffer 为本轮请求上下文规模, totals 为截至上一轮累计;
+    // 水位阈值随附 → 前端水位条分区着色(T4 压缩后下一轮自然回落)
+    deps.emit?.({
+      kind: "usage",
+      turn: state.turnCount,
+      bufferTokens: tokens,
+      totalTokensUsed: state.totalTokensUsed,
+      tokenBudget: deps.tokenBudget,
+      watermarks: {
+        effectiveWindow: wm.effectiveWindow,
+        autoCompactAt: wm.autoCompactAt,
+        warningAt: wm.warningAt,
+        blockingAt: wm.blockingAt,
+      },
+    });
 
     // ── 分支②: 调用 LLM(流式优先, 413 恢复路径) ──
     let response: Message;
@@ -236,6 +251,7 @@ export async function runQuery(
         state.totalTokensUsed +=
           u.input_tokens + u.output_tokens +
           (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+        deps.telemetry?.recordUsage(deps.session.sessionId, u); // 5h 滚动窗口聚合源(usage.jsonl)
         deps.log(
           `[usage] in=${u.input_tokens} out=${u.output_tokens} ` +
           `cache_read=${u.cache_read_input_tokens ?? 0} cache_create=${u.cache_creation_input_tokens ?? 0}` +

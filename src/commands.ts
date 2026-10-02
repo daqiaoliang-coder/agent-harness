@@ -17,6 +17,7 @@ export interface CommandContext {
   setMode(mode: PermissionMode): void;
   status(): string;
   permissionsSummary(): string;
+  usageSummary(): string;   // 最近 5h 用量窗口(telemetry.usageStats 格式化)
   log(line: string): void; // 命令输出通道
   exit(): void;            // CLI 关 readline; Web 无进程可退 → 提示关标签页
 }
@@ -67,6 +68,11 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
     name: "permissions",
     description: "权限规则概览(分层合并 + 会话级记忆)",
     run: (_args, ctx) => ctx.log(ctx.permissionsSummary()),
+  },
+  {
+    name: "usage",
+    description: "最近 5h 用量窗口(调用数/tokens 分解/会话数)",
+    run: (_args, ctx) => ctx.log(ctx.usageSummary()),
   },
   {
     name: "exit",

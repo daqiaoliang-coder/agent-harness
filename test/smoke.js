@@ -1449,7 +1449,7 @@ exit 1
     assert.ok(o2[0].includes("未知命令") && o2[0].includes("/help"), o2[0]);
   });
 
-  await test("/help 列出 5 命令;/status /permissions 输出经 ctx 回流", async () => {
+  await test("/help 列出内置命令;/status /permissions 输出经 ctx 回流", async () => {
     const { ctx, out } = mkCmdCtx();
     dispatchSlashCommand("/help", ctx);
     const helpText = out.join("\n");
@@ -1786,6 +1786,117 @@ exit 1
     });
     assert.strictEqual(badFmt.code, 1);
     assert.ok(badFmt.err.includes("--output-format 非法"), badFmt.err);
+  });
+
+  // ---------- Part 14: 用量遥测与仪表盘数据链路(recordUsage/usageStats + usage 事件 + /usage) ----------
+  console.log("[14] 用量遥测: 5h 滚动窗口 + usage 事件 + Mock 合成 usage + /usage 命令");
+  const { Telemetry: Telemetry14 } = require("../dist/telemetry/telemetry");
+
+  await test("usageStats: 滚动 5h 窗口聚合(旧记录剔除/cache 计入 total/多会话去重; 空态回退 startedAt)", async () => {
+    const dir14 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-usage-"));
+    const t = new Telemetry14(dir14);
+    const now = Date.now();
+    const iso = (msAgo) => new Date(now - msAgo).toISOString();
+    // 按时间序注入(6h 前 → 窗口外; 2h/1h 前 → 窗口内)
+    t.recordUsage("s3", { input_tokens: 999, output_tokens: 999 }, iso(6 * 3600e3));
+    t.recordUsage("s2", { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 30, cache_creation_input_tokens: 20 }, iso(2 * 3600e3));
+    t.recordUsage("s1", { input_tokens: 100, output_tokens: 50 }, iso(1 * 3600e3));
+    const s = t.usageStats();
+    assert.strictEqual(s.calls, 2, "6h 前记录应被窗口剔除");
+    assert.strictEqual(s.sessions, 2);
+    assert.deepStrictEqual(s.totals, { input: 110, output: 55, cacheRead: 30, cacheCreate: 20, total: 215 });
+    assert.strictEqual(s.windowMs, 5 * 60 * 60 * 1000);
+    assert.strictEqual(s.since, iso(2 * 3600e3), "since = 窗口内最早记录 ts");
+    // usage.jsonl 全量落盘(含窗口外记录 — 落盘不裁剪, 聚合才过滤)
+    const lines = fs.readFileSync(t.usageLogFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.strictEqual(lines.length, 3);
+    assert.strictEqual(lines[0].sessionId, "s3");
+    // 空态: 无窗口内记录 → calls=0, since 回退进程启动时间
+    const t2 = new Telemetry14(dir14);
+    const empty = t2.usageStats();
+    assert.strictEqual(empty.calls, 0);
+    assert.deepStrictEqual(empty.totals, { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, total: 0 });
+    assert.ok(empty.since, "空态 since 应回退进程启动时间");
+    fs.rmSync(dir14, { recursive: true, force: true });
+  });
+
+  await test("runQuery 轮入口发射 usage 事件: turn/buffer/水位阈值齐, totalTokensUsed 为调用前快照", async () => {
+    const events14 = [];
+    const provider = { name: "stub", complete: async () => ({ message: { role: "assistant", content: [{ type: "text", text: "done" }] } }) };
+    const noHooks = new HookRunner(parseHookSettings({}), os.tmpdir(), () => {});
+    const sessInfo = { sessionId: "s14", transcriptPath: path.join(os.tmpdir(), `smoke-usage-ev-${Date.now()}.jsonl`), cwd: os.tmpdir() };
+    const deps = {
+      provider,
+      tools: new ToolRegistry(),
+      permissions: new PermissionEngine({
+        rules: { allow: [], deny: [], ask: [] },
+        hooks: noHooks,
+        provider,
+        mode: "bypassPermissions",
+        userResponder: async () => "yes",
+        session: sessInfo,
+        log: () => {},
+      }),
+      hooks: noHooks,
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: ["test"],
+      systemTokens: 1,
+      model: "m",
+      artifactsDir: os.tmpdir(),
+      session: sessInfo,
+      getUserMessages: () => [],
+      emit: (e) => events14.push(e),
+      tokenBudget: 1000,
+      log: () => {},
+    };
+    const state = initLoopState();
+    state.messages.push({ role: "user", content: [{ type: "text", text: "go" }] });
+    await runQuery(deps, state, "user");
+    const usage = events14.filter((e) => e.kind === "usage");
+    assert.strictEqual(usage.length, 1, "单轮 → 恰 1 个 usage 事件");
+    const u = usage[0];
+    assert.strictEqual(u.turn, 1);
+    assert.ok(u.bufferTokens > 0, "buffer 为本轮请求上下文规模");
+    assert.strictEqual(u.totalTokensUsed, 0, "轮入口快照: stub 无 usage → 调用后累计仍 0");
+    assert.strictEqual(u.tokenBudget, 1000);
+    for (const k of ["effectiveWindow", "autoCompactAt", "warningAt", "blockingAt"]) {
+      assert.ok(typeof u.watermarks[k] === "number", `watermarks.${k}`);
+    }
+  });
+
+  await test("MockProvider 主轮返回合成 usage(estimateTokens 口径); 侧查询不计用量", async () => {
+    const mp = new MockProvider([{ text: "MOCK-USAGE" }]);
+    const msgs = [{ role: "user", content: [{ type: "text", text: "q" }] }];
+    const main = await mp.complete(["sys"], msgs, { maxTokens: 100 });
+    assert.strictEqual(mp.mainCallCount, 1);
+    assert.strictEqual(main.usage.input_tokens, estimateTokens("sys" + JSON.stringify(msgs)), "input = estimateTokens(sys+messages)");
+    assert.strictEqual(main.usage.output_tokens, estimateTokens(JSON.stringify(main.message.content)));
+    assert.strictEqual(main.usage.cache_read_input_tokens, 0);
+    assert.strictEqual(main.usage.cache_creation_input_tokens, 0);
+    // 侧查询(分类器/折叠/压缩)无 usage — 与真实侧查询不进计费口径一致
+    const side = await mp.complete(["[[CLASSIFIER_STAGE1]] 判断"], [], { maxTokens: 10 });
+    assert.strictEqual(side.usage, undefined, "侧查询不计用量");
+    assert.strictEqual(mp.sideQueryCount, 1);
+    assert.strictEqual(mp.mainCallCount, 1, "侧查询不消耗主轮脚本");
+  });
+
+  await test("/usage 命令: 输出经 ctx.usageSummary() 回流; /help 含 usage 条目", async () => {
+    const out14 = [];
+    const ctx14 = {
+      getMode: () => "default",
+      setMode: () => {},
+      status: () => "[status] fake",
+      permissionsSummary: () => "[permissions] fake",
+      usageSummary: () =>
+        "[usage] 最近 5h: 2 次调用 | 总计 215 tokens(in 110 / out 55 / cache_read 30 / cache_create 20) | 涉及 2 个会话",
+      log: (l) => out14.push(l),
+      exit: () => out14.push("EXIT"),
+    };
+    assert.strictEqual(dispatchSlashCommand("/usage", ctx14), true);
+    assert.strictEqual(out14.length, 1);
+    assert.ok(out14[0].includes("[usage]") && out14[0].includes("5h") && out14[0].includes("cache_read"), out14[0]);
+    dispatchSlashCommand("/help", ctx14);
+    assert.ok(out14.some((l) => l.includes("/usage")), "命令注册表应列出 /usage");
   });
 
   fs.rmSync(headlessHome, { recursive: true, force: true });

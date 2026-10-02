@@ -8,7 +8,8 @@
 //       会话级"总是允许" e2e(弹窗 alwaysRule → always 应答 → 同会话免弹窗 / 新会话不继承) /
 //       工具输入校验 e2e(坏输入不弹窗直接 error tool_result) /
 //       分层配置 e2e(独立 spawn + 用户级 allow 规则跨层生效, date 免弹窗) /
-//       slash 命令 + 模式运行中切换 e2e(独立 spawn: /mode 命令拦截 + plan 门禁 + /api/mode 下拉路径 + bypass 双确认)
+//       slash 命令 + 模式运行中切换 e2e(独立 spawn: /mode 命令拦截 + plan 门禁 + /api/mode 下拉路径 + bypass 双确认) /
+//       用量仪表盘 e2e(独立 spawn: 每轮 usage 事件水位快照 + GET /api/usage 5h 窗口聚合 + /usage 命令回流)
 // 用法: npm run build && node test/web-smoke.js
 const assert = require("assert");
 const http = require("http");
@@ -641,6 +642,90 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     sse19.close();
     server3.kill("SIGTERM");
     fs.rmSync(home19, { recursive: true, force: true });
+
+    // 20. 用量仪表盘 e2e: 独立 spawn → 独立 telemetry(usage 内存聚合只含本段记录, 断言确定性)。
+    //     三轮会话(ls 放行 → date 弹窗 no → 文本收尾)验证三条数据链路:
+    //     每轮 usage SSE 事件(轮入口水位快照) / GET /api/usage(5h 窗口聚合) / /usage 命令(同源格式化)
+    const PORT4 = 3996;
+    const BASE4 = `http://127.0.0.1:${PORT4}`;
+    const home20 = fs.mkdtempSync(path.join(os.tmpdir(), "web-smoke-home20-"));
+    const server4 = spawn("node", ["dist/cli.js", "web"], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        ANTHROPIC_API_KEY: "",
+        PORT: String(PORT4),
+        AUTH_TOKEN: TOKEN,
+        AGENT_HARNESS_NO_KEYCHAIN: "1",
+        AGENT_HARNESS_HOME: home20,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let server4Err = "";
+    server4.stderr.on("data", (d) => (server4Err += d.toString()));
+    let up4 = false;
+    for (let i = 0; i < 40 && !up4; i++) {
+      await sleep(250);
+      try {
+        await fetchJson("GET", "/api/sessions", undefined, TOKEN, BASE4);
+        up4 = true;
+      } catch { /* 等待启动 */ }
+    }
+    assert.ok(up4, `用量仪表盘 e2e 服务器未启动\nstderr: ${server4Err.slice(0, 1000)}`);
+    const sse20 = sseCollect(TOKEN, BASE4);
+    const ready20 = await sse20.waitFor((e) => e.kind === "ready");
+    const sess20 = ready20.sessionId;
+
+    // 20a. 三轮会话: 每轮入口恰一个 usage 事件(turn/buffer 快照 + 水位阈值, sessionId 标记)
+    const mark20 = sse20.events.length;
+    await fetchJson("POST", "/api/message", { text: "看下目录和时间", sessionId: sess20 }, TOKEN, BASE4);
+    const ls20 = await sse20.waitFor(
+      (e) => e.kind === "tool_start" && e.sessionId === sess20 && e.input && e.input.command === "ls -la", 15000, mark20
+    );
+    await sse20.waitFor((e) => e.kind === "tool_result" && e.sessionId === sess20 && e.id === ls20.id && !e.isError, 15000, mark20);
+    const perm20 = await sse20.waitFor(
+      (e) => e.kind === "permission_request" && e.sessionId === sess20 && e.input && e.input.command === "date", 15000, mark20
+    );
+    await fetchJson("POST", `/api/permission/${encodeURIComponent(perm20.id)}`, { answer: "no" }, TOKEN, BASE4);
+    await sse20.waitFor((e) => e.kind === "stop" && e.sessionId === sess20, 15000, mark20);
+    const usages20 = sse20.events.slice(mark20).filter((e) => e.kind === "usage" && e.sessionId === sess20);
+    assert.ok(usages20.length >= 3, `三轮会话应 ≥3 个 usage 事件(实际 ${usages20.length})`);
+    assert.strictEqual(usages20[0].turn, 1, "首个 usage 事件为 turn 1");
+    assert.strictEqual(usages20[0].totalTokensUsed, 0, "轮入口快照: 首事件为首次调用前累计");
+    for (const u of usages20.slice(0, 3)) {
+      assert.ok(u.bufferTokens > 0, "buffer 为本轮请求上下文规模");
+      for (const k of ["effectiveWindow", "autoCompactAt", "warningAt", "blockingAt"]) {
+        assert.ok(typeof u.watermarks[k] === "number", `watermarks.${k}`);
+      }
+    }
+    passed++; console.log("  ✓ usage SSE 事件: 每轮水位快照(turn/buffer/水位阈值, sessionId 标记)");
+
+    // 20b. GET /api/usage: 5h 窗口聚合(Mock 合成 usage → 非零) + 活动会话实时累计
+    const usage20 = await fetchJson("GET", "/api/usage", undefined, TOKEN, BASE4);
+    assert.strictEqual(usage20.status, 200);
+    assert.ok(usage20.body.calls >= 3, `窗口内调用数 ≥3(实际 ${usage20.body.calls})`);
+    assert.ok(usage20.body.totals.input > 0 && usage20.body.totals.output > 0, "Mock 合成 usage → in/out 非零");
+    assert.ok(usage20.body.totals.total > 0);
+    assert.ok(usage20.body.since, "窗口起点 ts");
+    const live20 = (usage20.body.liveSessions ?? []).find((l) => l.id === sess20);
+    assert.ok(live20, "活动会话列表含当前会话");
+    assert.ok(live20.tokensUsed > 0, "Mock 合成 usage → 会话累计计费 tokens 非零");
+    assert.strictEqual(live20.turns, 3, "三轮会话");
+    passed++; console.log("  ✓ GET /api/usage: 5h 窗口聚合 + 活动会话实时用量");
+
+    // 20c. /usage 命令: command_output 回流同源格式化(不消耗 mock 轮次)
+    const mark20c = sse20.events.length;
+    const cmd20 = await fetchJson("POST", "/api/message", { text: "/usage", sessionId: sess20 }, TOKEN, BASE4);
+    assert.strictEqual(cmd20.status, 200);
+    assert.strictEqual(cmd20.body.command, true);
+    await sse20.waitFor(
+      (e) => e.kind === "command_output" && e.sessionId === sess20 && e.text.includes("[usage]") && e.text.includes("5h"), 15000, mark20c
+    );
+    passed++; console.log("  ✓ /usage 命令: 5h 用量窗口经 command_output 回流");
+
+    sse20.close();
+    server4.kill("SIGTERM");
+    fs.rmSync(home20, { recursive: true, force: true });
 
     sse.close();
     fs.rmSync(emptyHome, { recursive: true, force: true });
