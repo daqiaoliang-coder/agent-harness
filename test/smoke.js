@@ -422,7 +422,7 @@ async function test(name, fn) {
   await test("TaskTool: 派发 → 返回子代理报告; 缺 prompt 报错", async () => {
     const task = new TaskTool(async (prompt, maxTurns) => `报告(${prompt.length}/${maxTurns})`);
     const r = await task.execute({ description: "查", prompt: "调查压缩管线" });
-    assert.ok(!r.isError && r.content === "报告(6/12)"), JSON.stringify(r);
+    assert.ok(!r.isError && r.content === "报告(6/12)", JSON.stringify(r));
     const bad = await task.execute({ description: "x" });
     assert.ok(bad.isError && bad.content.includes("参数错误"));
   });
@@ -3020,6 +3020,28 @@ exit 1
       session.close();
       try { fs.rmSync(path.join(SESSIONS_DIR, `${sid}.jsonl`), { force: true }); } catch { /* 空 transcript 可能未落盘 */ }
     }
+  });
+
+  await test("--help/-h: 顶层与子命令首位打印帮助并退出 0; 未知子命令退出 1", async () => {
+    const runHelp = (args) =>
+      new Promise((resolve) => {
+        const c = spawn("node", ["dist/cli.js", ...args], {
+          cwd: path.resolve(__dirname, ".."),
+          env: HEADLESS_ENV, // 隔离 Keychain/用户级 settings
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "";
+        c.stdout.on("data", (d) => (out += d.toString()));
+        c.stderr.on("data", () => {});
+        c.on("close", (code) => resolve({ code, out }));
+      });
+    for (const args of [["--help"], ["-h"], ["help"], ["chat", "--help"]]) {
+      const r = await runHelp(args);
+      assert.strictEqual(r.code, 0, `${args.join(" ")} → ${r.code}`);
+      assert.ok(r.out.includes("子命令") && r.out.includes("chat"), `${args.join(" ")}:\n${r.out}`);
+    }
+    const bad = await runHelp(["nope-sub"]);
+    assert.strictEqual(bad.code, 1, "未知子命令 → 退出 1");
   });
 
   fs.rmSync(dirP20, { recursive: true, force: true });

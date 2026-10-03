@@ -15,6 +15,7 @@ cat app.log | node dist/cli.js chat -p "find anomalies"               # stdin at
 cat prompt.txt | node dist/cli.js chat --output-format stream-json    # no -p: stdin is the prompt
 
 node dist/cli.js key set|get|rm|status   # API key management via macOS Keychain (no plaintext .env)
+node dist/cli.js --help                  # full subcommand/flag reference (also: <sub> --help)
 ```
 
 ## What It Is
@@ -47,6 +48,7 @@ A **zero-dependency** harness that exercises the full Claude-style agent loop:
 - **Usage dashboard**: every billable LLM call (input/output + cache read/write) is appended to `.agent-harness/telemetry/usage.jsonl` and aggregated over a rolling **5-hour window**; the same numbers feed three surfaces — a per-turn `usage` SSE event (turn-entry watermark snapshot: buffer vs effectiveWindow plus autoCompact/warning/blocking thresholds) driving the Web topbar context gauge, `GET /api/usage` (window totals + per-live-session usage, polled every 30s), and the `/usage` slash command; the MockProvider synthesizes `estimateTokens`-based usage so the mock/demo pipeline exercises the same dashboard end-to-end
 - **Hooks system**: `.claudeignore`-style hooks with stdout-JSON + exit-code protocol
 - **MCP integration**: stdio JSON-RPC server/client
+- **Engineering hygiene**: `--help`/`-h` at the top level or immediately after any subcommand prints the full CLI reference (subcommands, chat flags incl. headless `-p`/`--output-format`/`--permission-mode`, env vars) and exits 0; ESLint flat config (`@eslint/js` + `typescript-eslint` recommended sets, dev-only — the runtime stays zero-dependency) wired as `npm run lint` with repo-idiom relaxations (lazy `require` for cycle breaking, `no-explicit-any`, `_`-prefixed unused vars); GitHub Actions CI running `check` + `lint` + both smoke suites on a Node 20/22 matrix; `bin` (`agent-harness`) + `files` + `engines >= 18` with the shebang preserved through `tsc` into `dist/cli.js` — publish/npx-ready
 
 ## Architecture
 
@@ -95,8 +97,10 @@ demo/
   web/index.html    single-page frontend
   settings.json     project-level settings: permission rules + hooks + MCP servers
 test/
-  smoke.js          155-unit engine regression (no real API; incl. streaming-retry e2e via fake SSE server with mid-stream cut + cache multi-breakpoint e2e + headless -p / stdin / output-format e2e + usage window/event e2e + TodoWrite todo-list e2e + CLAUDE.md project-memory lookup/cascade/truncation units + WebSearch injectable-backend units + WebFetch SSRF/htmlToText/abort units + Edit multi-edit atomicity/preview units + session title/search/export/fork units + FileStateStore persistence units + Git whitelist/execute units + diagnostics buffer units + diagnostic-feedback e2e)
+  smoke.js          156-unit engine regression (no real API; incl. streaming-retry e2e via fake SSE server with mid-stream cut + cache multi-breakpoint e2e + headless -p / stdin / output-format e2e + usage window/event e2e + TodoWrite todo-list e2e + CLAUDE.md project-memory lookup/cascade/truncation units + WebSearch injectable-backend units + WebFetch SSRF/htmlToText/abort units + Edit multi-edit atomicity/preview units + session title/search/export/fork units + FileStateStore persistence units + Git whitelist/execute units + diagnostics buffer units + diagnostic-feedback e2e + --help e2e)
   web-smoke.js      39-unit Web/SSE regression (auth + abort e2e + multi-session + telemetry + permission always e2e + input validation e2e + layered-settings e2e + slash-commands/mode-switch e2e + usage-dashboard e2e + todo-list e2e via AGENT_HARNESS_MOCK_SCRIPT + session-management endpoints e2e + filestate crash-restart/resume e2e, no real API)
+.github/workflows/ci.yml  CI: node 20/22 matrix (check + lint + smoke + smoke:web)
+eslint.config.js     eslint flat config (@eslint/js + typescript-eslint, dev-only tooling)
 ```
 
 ## Attribution

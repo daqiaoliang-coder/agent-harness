@@ -109,7 +109,8 @@ export async function fetchPage(
   } catch (e) {
     if (opts.signal?.aborted) throw e; // 用户中止交由 execute 统一译为 [aborted by user]
     throw new Error(
-      `请求失败: ${(e as Error).name === "AbortError" ? `${opts.timeoutMs}ms 超时` : (e as Error).message}`
+      `请求失败: ${(e as Error).name === "AbortError" ? `${opts.timeoutMs}ms 超时` : (e as Error).message}`,
+      { cause: e }
     );
   } finally {
     clearTimeout(timer);

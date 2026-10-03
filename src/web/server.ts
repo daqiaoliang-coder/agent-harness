@@ -212,7 +212,7 @@ function makeProvider(merged: Pick<MergedSettings, "model">): { provider: LLMPro
     try {
       turns = JSON.parse(mockScript);
     } catch (e) {
-      throw new Error(`AGENT_HARNESS_MOCK_SCRIPT 解析失败(须为 ScriptedTurn[] JSON): ${(e as Error).message}`);
+      throw new Error(`AGENT_HARNESS_MOCK_SCRIPT 解析失败(须为 ScriptedTurn[] JSON): ${(e as Error).message}`, { cause: e });
     }
     console.log("[web] AGENT_HARNESS_MOCK_SCRIPT 显式注入 → mock 模式(测试通道)");
     return { provider: new MockProvider(turns), model: "mock", mode: "default", providerName: "mock" };

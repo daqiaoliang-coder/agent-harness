@@ -107,7 +107,7 @@ function buildEditPreview(p: string, toolInput: Record<string, unknown>): Permis
 // Write: 新文件展示前 MAX 行; 覆盖时公共前后缀行裁剪, 中间 del(旧)/add(新)
 function buildWritePreview(p: string, toolInput: Record<string, unknown>): PermissionPreview {
   const content = String(toolInput.content ?? "");
-  let old: string | null = null;
+  let old: string | null;
   try {
     old = fs.readFileSync(p, "utf8");
   } catch {

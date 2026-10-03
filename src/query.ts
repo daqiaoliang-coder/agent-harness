@@ -187,10 +187,10 @@ export async function runQuery(
           );
           if (state.consecutiveAutoCompactFailures >= deps.cfg.maxConsecutiveAutoCompactFailures) {
             // 熔断: 连续失败达上限, 升级为用户可见错误
-            throw new Error(`autocompact 熔断: 连续失败 ${state.consecutiveAutoCompactFailures} 次`);
+            throw new Error(`autocompact 熔断: 连续失败 ${state.consecutiveAutoCompactFailures} 次`, { cause: e });
           }
           if (tokens >= wm.blockingAt) {
-            throw new Error(`blocking 水位 ${wm.blockingAt} 且 autocompact 失败, 拒绝继续`);
+            throw new Error(`blocking 水位 ${wm.blockingAt} 且 autocompact 失败, 拒绝继续`, { cause: e });
           }
         }
       }

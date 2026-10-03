@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // 架构参考: cli.ts(xterm + blessed 交互 UI); 此处双模式入口:
 //   demo — MockProvider 脚本化全链路演示(无需 API key): npm run demo
 //   chat — 真实 Anthropic API + readline REPL + 真实权限弹窗: npm run chat
@@ -735,9 +736,8 @@ async function runHeadless(args: string[]): Promise<void> {
     try {
       provider = new MockProvider(JSON.parse(mockScript) as ScriptedTurn[]);
     } catch (e) {
-      throw new Error(`AGENT_HARNESS_MOCK_SCRIPT 解析失败(须为 ScriptedTurn[] JSON): ${(e as Error).message}`);
+      throw new Error(`AGENT_HARNESS_MOCK_SCRIPT 解析失败(须为 ScriptedTurn[] JSON): ${(e as Error).message}`, { cause: e });
     }
-    model = "mock";
   } else {
     const resolved = resolveApiKey();
     if (!resolved) {
@@ -919,8 +919,43 @@ async function runSessionsCommand(args: string[]): Promise<void> {
   throw new Error(`未知子命令: ${sub} — 用法: node dist/cli.js sessions [list|search <q>|export <id>]`);
 }
 
+// --help/-h 文案(顶层或子命令首位: agent-harness --help / agent-harness chat --help)
+const HELP = [
+  "agent-harness — 零依赖 Claude Code 参考实现",
+  "",
+  "用法: agent-harness <子命令> [选项]   (或: node dist/cli.js <子命令>)",
+  "",
+  "子命令:",
+  "  chat       交互式 REPL(真实 Anthropic API; key 解析顺序 env > Keychain > mock)",
+  "  demo       MockProvider 脚本化全链路演示(无需 API key)",
+  "  web        SSE 服务器 + 单页前端(127.0.0.1, 启动 token 鉴权)",
+  "  key        API key 管理: set|get|rm|status(macOS Keychain)",
+  "  sessions   会话管理: list | search <q> | export <id> [--jsonl] [--out <file>]",
+  "",
+  "chat 选项:",
+  "  --resume [sessionId]              恢复会话(缺省取最近的 sess_chat_*)",
+  "  --plan                            以 plan 模式启动(只读探索)",
+  "  --append-system-prompt \"…\"        系统提示追加段",
+  "  -p, --print \"query\"               headless 单发(管道 stdin 作附加上下文)",
+  "  --output-format text|json|stream-json   headless 输出格式(stdout 纯净, 日志走 stderr)",
+  "  --permission-mode default|auto|plan|bypassPermissions   headless 启动模式",
+  "  --dangerous                       bypassPermissions 的显式风险确认",
+  "",
+  "环境变量:",
+  "  ANTHROPIC_API_KEY / ANTHROPIC_MODEL(默认 claude-sonnet-4-5) / ANTHROPIC_BASE_URL(网关)",
+  "  AGENT_HARNESS_HOME                用户级配置目录重定向(默认 ~/.agent-harness)",
+  "  AGENT_HARNESS_MOCK_SCRIPT         显式注入 MockProvider 脚本(测试; 优先于 API key)",
+  "",
+  "运行中命令: /help /status /mode /permissions /usage /exit — 详见 README.md",
+].join("\n");
+
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "demo";
+  if (mode === "help" || mode === "--help" || mode === "-h" ||
+      process.argv[3] === "--help" || process.argv[3] === "-h") {
+    console.log(HELP);
+    return;
+  }
   if (mode === "demo") return runDemo();
   if (mode === "chat") return runChat();
   if (mode === "key") return runKeyCommand(process.argv.slice(3));
@@ -930,7 +965,7 @@ async function main(): Promise<void> {
     const { runWeb } = require("./web/server") as { runWeb: () => Promise<void> };
     return runWeb();
   }
-  console.error("用法: node dist/cli.js [demo|chat|web] | key [set|get|rm|status] | sessions [list|search|export]");
+  console.error(`未知子命令: ${mode}\n用法: node dist/cli.js [demo|chat|web|key|sessions] — 详情 --help`);
   process.exit(1);
 }
 

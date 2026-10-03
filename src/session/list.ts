@@ -3,7 +3,6 @@
 // 标题不落盘: 由首条用户消息实时派生(零 schema 变更, 永不与 transcript 脱同步)。
 import * as fs from "fs";
 import * as path from "path";
-import { Message } from "../types";
 import { loadTranscript } from "./resume";
 
 // 头部预读上限: 标题只需首条用户消息, 大会话不整读(参考实现务实取舍)
@@ -35,7 +34,7 @@ export function listSessionFiles(sessionsDir: string): Array<{ id: string; file:
 
 // 标题 = 首条用户消息首行截断(读头部即可; 无用户消息 → "(空会话)")
 export function deriveTitle(file: string): string {
-  let head = "";
+  let head: string;
   try {
     const fd = fs.openSync(file, "r");
     try {
@@ -94,7 +93,7 @@ export function searchSessions(sessionsDir: string, query: string): { query: str
   const results: SessionSearchResult[] = [];
   for (const { id, file, mtime } of listSessionFiles(sessionsDir)) {
     if (results.length >= MAX_SESSIONS) break;
-    let raw = "";
+    let raw: string;
     try {
       raw = fs.readFileSync(file, "utf8");
     } catch {

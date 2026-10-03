@@ -235,7 +235,7 @@ export class PermissionEngine {
   private async firePermissionDenied(
     toolName: string,
     toolInput: Record<string, unknown>,
-    reason: string
+    _reason: string
   ): Promise<void> {
     // PermissionDenied 事件(demo 未配置 hook → 无操作)
     await this.deps.hooks.run("PermissionDenied", { toolName, toolInput }, this.deps.session);

@@ -6,7 +6,7 @@
 //   其他非零退出码 = 非阻断错误(警告后继续, 崩溃 ≠ 拦截)
 // 同事件多 hook 严格顺序执行; 聚合规则: deny > ask > allow
 import { spawn } from "child_process";
-import { HookConfig, HookDecision, HookEventName, HookPayload, HookSettings } from "./events";
+import { HookDecision, HookEventName, HookPayload, HookSettings } from "./events";
 
 export interface HookSessionInfo {
   sessionId: string;
