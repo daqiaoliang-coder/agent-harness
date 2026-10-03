@@ -17,6 +17,7 @@ import { PermissionEngine } from "./permissions/engine";
 import { HookRunner } from "./hooks/runner";
 import { ToolRegistry } from "./tools/tool";
 import { validateToolInput, formatValidationIssues } from "./tools/validate";
+import { DiagnosticsBuffer } from "./tools/diagnostics";
 import { UiEvent } from "./events";
 import { Telemetry } from "./telemetry/telemetry";
 
@@ -63,6 +64,8 @@ export interface QueryDeps {
   tokenBudget?: number;
   // 错误遥测(可选): 工具级失败计数(引擎级异常由 cli.ts createSession 统一记录)
   telemetry?: Telemetry;
+  // 诊断回灌(可选): lint/test/build 类 Bash 命令结果缓冲 → 下一条用户消息注入未解决项(cli.ts send 消费)
+  diagnostics?: DiagnosticsBuffer;
   log: (line: string) => void;
 }
 
@@ -388,6 +391,11 @@ export async function runQuery(
             ])
           : await tool.execute(tu.input);
         if (exec.isError) deps.telemetry?.recordToolError(); // 遥测: 工具执行失败(计数不落盘)
+        // 诊断回灌: 验证类命令结果入缓冲(成功消解/失败 upsert) → 下一条用户消息注入提醒
+        if (tu.name === "Bash") {
+          const bashCmd = (tu.input as { command?: unknown }).command;
+          if (typeof bashCmd === "string") deps.diagnostics?.record(bashCmd, !exec.isError, exec.content);
+        }
         await deps.hooks.run("PostToolUse", { toolName: tu.name, toolInput: tu.input }, sess);
         return {
           type: "tool_result",

@@ -9,7 +9,7 @@ const http = require("http");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const { EditTool } = require("../dist/tools/edit");
 const { ReadTool } = require("../dist/tools/read");
@@ -2873,6 +2873,156 @@ exit 1
   });
 
   fs.rmSync(dirP19, { recursive: true, force: true });
+
+  // ---------- Part 20: git 一等公民 + 诊断回灌(P2c 代码智能) ----------
+  console.log("[20] Git 工具 + 诊断回灌");
+  const { GitTool } = require("../dist/tools/git");
+  const { isDiagnosticCommand, DiagnosticsBuffer } = require("../dist/tools/diagnostics");
+  const dirP20 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-p20-"));
+  const runGit = (args, cwd) => spawnSync("git", args, { cwd, encoding: "utf8" });
+
+  await test("Git: checkPermissions — status/diff/log/show 静态 allow; 写操作 deny 引导 Bash; 空 args 无意见", async () => {
+    const g = new GitTool();
+    for (const sub of ["status", "diff", "log", "show"]) {
+      assert.strictEqual(g.checkPermissions({ args: [sub] }).decision, "allow", sub);
+    }
+    const d = g.checkPermissions({ args: ["push", "origin", "main"] });
+    assert.strictEqual(d.decision, "deny");
+    assert.ok(d.reason.includes("Bash"), d.reason);
+    assert.strictEqual(g.checkPermissions({ args: [] }).decision, null, "空 args 无意见(交由校验层拦截)");
+  });
+
+  await test("Git: execute — 建仓后 status/log 直查; push 白名单外报错引导; 非 git 目录 fatal 入 isError", async () => {
+    const repo = path.join(dirP20, "repo");
+    fs.mkdirSync(repo);
+    runGit(["init"], repo);
+    runGit(["config", "user.email", "smoke@test.local"], repo);
+    runGit(["config", "user.name", "smoke"], repo);
+    fs.writeFileSync(path.join(repo, "f.txt"), "hello\n", "utf8");
+    runGit(["add", "f.txt"], repo);
+    runGit(["commit", "-m", "init"], repo);
+    const g = new GitTool();
+    const st = await g.execute({ args: ["status"], path: repo });
+    assert.ok(!st.isError && st.content.includes("nothing to commit"), JSON.stringify(st));
+    const log = await g.execute({ args: ["log", "--oneline"], path: repo });
+    assert.ok(!log.isError && log.content.includes("init"), JSON.stringify(log));
+    const push = await g.execute({ args: ["push", "origin", "main"], path: repo });
+    assert.ok(push.isError && push.content.includes("Bash"), "写操作 execute 二次校验拦截并引导 Bash");
+    const bad = await g.execute({ args: ["status"], path: dirP20 });
+    assert.ok(bad.isError && /not a git repository/i.test(bad.content), JSON.stringify(bad));
+  });
+
+  await test("isDiagnosticCommand: 验证类命令命中; 非验证类不误报", async () => {
+    for (const c of [
+      "npm test", "npm run build", "yarn test", "pnpm ci", "npx tsc --noEmit", "tsc --noEmit",
+      "eslint src", "vitest run", "jest", "mocha", "pytest -x", "go test ./...", "go vet ./...",
+      "cargo test", "cargo build", "make", "make build", "mvn verify", "gradle build",
+    ]) {
+      assert.ok(isDiagnosticCommand(c), `应命中: ${c}`);
+    }
+    for (const c of ["ls -la", "echo hi", "cat file", "git status", "npm install", "makefile", "node server.js"]) {
+      assert.ok(!isDiagnosticCommand(c), `不应误报: ${c}`);
+    }
+  });
+
+  await test("DiagnosticsBuffer: 失败入缓冲(尾部截断)/成功消解/非诊断 no-op/上限 3 淘汰最旧/render 格式", async () => {
+    const buf = new DiagnosticsBuffer();
+    assert.strictEqual(buf.render(), "", "空缓冲不渲染");
+    buf.record("ls -la", false, "boom"); // 非诊断命令 → no-op
+    assert.strictEqual(buf.unresolved.length, 0);
+    buf.record("npm test", false, "x".repeat(400) + "TAIL-MARKER"); // 失败 → 入缓冲, 只留尾部
+    assert.strictEqual(buf.unresolved.length, 1);
+    assert.ok(buf.unresolved[0].tail.length <= 250 && buf.unresolved[0].tail.endsWith("TAIL-MARKER"));
+    const rendered = buf.render();
+    assert.ok(rendered.includes("[诊断提醒]") && rendered.includes("npm test"), rendered);
+    buf.record("npm test", true, ""); // 同命令成功重跑 → 消解
+    assert.strictEqual(buf.unresolved.length, 0);
+    assert.strictEqual(buf.render(), "");
+    buf.record("make", false, "a");
+    buf.record("tsc --noEmit", false, "b");
+    buf.record("cargo test", false, "c");
+    buf.record("eslint .", false, "d"); // 第 4 条 → 最旧(make)淘汰
+    assert.deepStrictEqual(buf.unresolved.map((e) => e.command), ["tsc --noEmit", "cargo test", "eslint ."]);
+    buf.record("make", false, "e"); // 重新失败 → 重新入缓冲(最新)
+    buf.record("make", false, "f"); // upsert → 条数不变, tail 刷新
+    assert.strictEqual(buf.unresolved.length, 3);
+    assert.strictEqual(buf.unresolved.find((e) => e.command === "make").tail, "f");
+  });
+
+  await test("诊断回灌 e2e: 验证命令失败 → 下一条用户消息注入提醒; 同命令成功重跑 → 消解", async () => {
+    const mf = path.join(dirP20, "Makefile");
+    const cmd = `make -f ${mf}`;
+    const script = [
+      { toolUses: [{ name: "Bash", input: { command: cmd } }] }, // ① Makefile 尚不存在 → exit 2
+      { text: "构建失败" },
+      { toolUses: [{ name: "Bash", input: { command: cmd } }] }, // ③ Makefile 已建 → exit 0 → 消解
+      { text: "构建通过" },
+      { text: "done" },
+    ];
+    const sid = `sess_smoke_diag_${Date.now()}`;
+    const session = await createSession({
+      provider: new MockProvider(script),
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: "BASE-PROMPT",
+      rules: { allow: [], deny: [], ask: [] },
+      hookSettings: parseHookSettings({}),
+      sessionId: sid,
+      mode: "default",
+      userResponder: async () => "yes", // make 走权限弹窗 → 放行(真实执行)
+    });
+    try {
+      await session.send("跑构建");
+      const m1 = session.state.messages;
+      assert.strictEqual(m1.length, 4, "user + tool_use + tool_result + text");
+      assert.ok(m1[2].content[0].is_error, "make 无 Makefile → 失败入树");
+      fs.writeFileSync(mf, "a:\n\t@echo ok\n", "utf8"); // 建 Makefile(\t 为真 tab)
+      await session.send("继续");
+      const m2 = session.state.messages;
+      const u2 = m2[4]; // send2 的用户消息
+      assert.strictEqual(u2.role, "user");
+      assert.strictEqual(u2.content.length, 2, "诊断提醒以第二个 text 块注入");
+      assert.strictEqual(u2.content[0].text, "继续", "首块保持用户原文");
+      assert.ok(u2.content[1].text.includes("诊断提醒") && u2.content[1].text.includes(cmd), u2.content[1].text);
+      assert.ok(!m2[6].content[0].is_error, "Makefile 已建 → 同命令成功重跑");
+      await session.send("收尾");
+      const m3 = session.state.messages;
+      const u3 = m3[8]; // send3 的用户消息
+      assert.strictEqual(u3.content.length, 1, "已消解 → 不再注入");
+      assert.strictEqual(u3.content[0].text, "收尾");
+      assert.deepStrictEqual(
+        session.deps.getUserMessages(),
+        ["跑构建", "继续", "收尾"],
+        "分类器盲视: userPrompts 保持用户原文(不含注入)"
+      );
+    } finally {
+      session.close();
+      for (const ext of [".jsonl", ".filestate.json"]) {
+        try { fs.rmSync(path.join(SESSIONS_DIR, sid + ext), { force: true }); } catch { /* 可能未落盘 */ }
+      }
+    }
+  });
+
+  await test("createSession: Git 工具已注册(工具表可发现)", async () => {
+    const sid = `sess_smoke_git_${Date.now()}`;
+    const session = await createSession({
+      provider: new MockProvider([]),
+      cfg: DEMO_COMPACT_CONFIG,
+      systemPrompt: "BASE",
+      rules: { allow: [], deny: [], ask: [] },
+      hookSettings: parseHookSettings({}),
+      sessionId: sid,
+      mode: "default",
+      userResponder: async () => "no",
+    });
+    try {
+      assert.ok(session.deps.tools.get("Git"), "Git 工具应注册");
+    } finally {
+      session.close();
+      try { fs.rmSync(path.join(SESSIONS_DIR, `${sid}.jsonl`), { force: true }); } catch { /* 空 transcript 可能未落盘 */ }
+    }
+  });
+
+  fs.rmSync(dirP20, { recursive: true, force: true });
 
   fs.rmSync(headlessHome, { recursive: true, force: true });
 

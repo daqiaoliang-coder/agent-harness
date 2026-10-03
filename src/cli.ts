@@ -23,6 +23,8 @@ import { GrepTool } from "./tools/grep";
 import { TodoWriteTool } from "./tools/todowrite";
 import { WebSearchTool } from "./tools/websearch";
 import { WebFetchTool } from "./tools/webfetch";
+import { GitTool } from "./tools/git";
+import { DiagnosticsBuffer } from "./tools/diagnostics";
 import { TaskTool } from "./tools/task";
 import { FileStateStore } from "./tools/fileState";
 import { createExploreAgent } from "./agent/subagent";
@@ -66,7 +68,8 @@ const DEMO_SYSTEM_PROMPT = [
 
 const CHAT_SYSTEM_PROMPT = [
   "You are agent-harness, a minimal coding agent (architecture reference implementation)。",
-  "可用工具: Bash(执行命令), Read(读文件), Edit(精确替换编辑, 多处修改用 edits 数组一次原子完成), Write(写文件), Glob(文件名匹配), Grep(内容搜索), TodoWrite(任务清单), Task(只读子代理调查), WebSearch(联网搜索), WebFetch(抓取网页转文本)。",
+  "可用工具: Bash(执行命令), Read(读文件), Edit(精确替换编辑, 多处修改用 edits 数组一次原子完成), Write(写文件), Glob(文件名匹配), Grep(内容搜索), TodoWrite(任务清单), Task(只读子代理调查), WebSearch(联网搜索), WebFetch(抓取网页转文本), Git(只读 git 查询)。",
+  "查看 git 仓库状态用 Git 工具(status/diff/log/show 免确认); git 写操作(commit/push/checkout 等)用 Bash。",
   "多步任务(≥3 步)先用 TodoWrite 建清单: 恰好保持一项 in_progress, 步骤状态变化时立即更新, 全部完成后标尽; 清单为全量替换(每次传完整清单)。",
   "查找文件优先用 Glob/Grep(只读免确认), 而非 Bash 的 find/grep。",
   "大范围调查类任务(如\"梳理某机制的所有相关文件\")用 Task 派发子代理, 独立上下文省 token。",
@@ -173,6 +176,8 @@ export async function createSession(opts: {
   tools.register(new WebSearchTool({ log: logS }));
   // WebFetch: 抓取网页转文本(只读网络操作, 静态 allow); SSRF 主机名防线 + FetchFn 注入式可替换
   tools.register(new WebFetchTool({ log: logS }));
+  // Git: 只读子命令(status/diff/log/show)静态放行免弹窗; 写操作 deny 引导 Bash(argv 直 spawn 无注入面)
+  tools.register(new GitTool());
   // Task: explore 型只读子代理(独立上下文); 子代理注册表不含 Task → 防无限嵌套
   tools.register(new TaskTool(createExploreAgent({
     provider: opts.provider,
@@ -188,6 +193,8 @@ export async function createSession(opts: {
   mcp.tools.forEach((t) => tools.register(t));
 
   const userPrompts: string[] = [];
+  // 诊断回灌: 验证类命令(lint/test/build)失败缓冲 → 下一条用户消息注入未解决项提醒(会话级)
+  const diagnostics = new DiagnosticsBuffer();
   // 错误遥测: 工具失败计数(query.ts) + 引擎级异常落盘(send catch); 进程级共享实例
   const telemetry = getTelemetry(PROJECT_ROOT);
   // 系统提示组装: 前缀(opts.systemPrompt)+ plan 后缀按当前模式动态增删(单一事实来源 = 当前模式);
@@ -214,6 +221,7 @@ export async function createSession(opts: {
     maxTurns: opts.engine?.maxTurns,
     tokenBudget: opts.engine?.tokenBudget,
     telemetry,
+    diagnostics,
     log: logS,
   };
   const state = initLoopState();
@@ -250,7 +258,13 @@ export async function createSession(opts: {
     try {
       await hooks.run("UserPromptSubmit", {}, session);
       userPrompts.push(text);
-      const msg: Message = { role: "user", content: [{ type: "text", text }] };
+      // 诊断回灌: 未通过验证命令以第二个 text 块随用户消息注入(入树 + transcript → resume 可重放;
+      // userPrompts 保持用户原文, 分类器盲视注入内容)
+      const diagNote = diagnostics.render();
+      const msg: Message = {
+        role: "user",
+        content: [{ type: "text", text }, ...(diagNote ? [{ type: "text" as const, text: diagNote }] : [])],
+      };
       state.messages.push(msg);
       fs.appendFileSync(
         transcriptPath,
