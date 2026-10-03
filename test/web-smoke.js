@@ -9,7 +9,9 @@
 //       工具输入校验 e2e(坏输入不弹窗直接 error tool_result) /
 //       分层配置 e2e(独立 spawn + 用户级 allow 规则跨层生效, date 免弹窗) /
 //       slash 命令 + 模式运行中切换 e2e(独立 spawn: /mode 命令拦截 + plan 门禁 + /api/mode 下拉路径 + bypass 双确认) /
-//       用量仪表盘 e2e(独立 spawn: 每轮 usage 事件水位快照 + GET /api/usage 5h 窗口聚合 + /usage 命令回流)
+//       用量仪表盘 e2e(独立 spawn: 每轮 usage 事件水位快照 + GET /api/usage 5h 窗口聚合 + /usage 命令回流) /
+//       会话管理端点(列表标题 / 跨会话搜索 / markdown|jsonl 导出 / fork+upto) /
+//       Edit 快照持久化 e2e(独立 spawn: Read 落盘 filestate → SIGKILL 崩溃 → 重启 resume → Edit 免重新 Read)
 // 用法: npm run build && node test/web-smoke.js
 const assert = require("assert");
 const http = require("http");
@@ -453,6 +455,67 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     );
     passed++; console.log("  ✓ 工具输入校验 e2e: 坏输入不弹窗直接 error tool_result(计入遥测)");
 
+    // 17b. 会话管理端点(P2b): 列表标题 / 跨会话搜索 / 导出(markdown|jsonl) / fork。
+    //      全部无状态读落盘 transcript → 不消耗 mock 轮次, 不影响后续独立 spawn 用例
+    const sessList17 = await fetchJson("GET", "/api/sessions");
+    const sessAInfo = sessList17.body.sessions.find((s) => s.id === sessA);
+    assert.ok(sessAInfo, "会话列表应含 sessA");
+    assert.strictEqual(sessAInfo.title, "看下目录和时间", "标题 = 首条用户消息实时派生");
+    assert.ok(typeof sessAInfo.size === "number" && sessAInfo.size > 0);
+    passed++; console.log("  ✓ /api/sessions: 会话行携带派生标题与大小");
+
+    const search17 = await fetchJson("GET", `/api/session/search?q=${encodeURIComponent("看下目录和时间")}`);
+    assert.strictEqual(search17.status, 200);
+    const hitA = search17.body.results.find((r) => r.sessionId === sessA);
+    assert.ok(hitA, "搜索结果应含 sessA");
+    assert.strictEqual(hitA.title, "看下目录和时间");
+    assert.ok(hitA.hits.length >= 1 && hitA.hits[0].role === "user");
+    assert.ok(hitA.hits[0].snippet.includes("看下目录和时间"));
+    const searchBlank = await fetchJson("GET", "/api/session/search?q=%20%20");
+    assert.strictEqual(searchBlank.status, 400, "空白 q → 400");
+    const searchMiss = await fetchJson("GET", `/api/session/search?q=${encodeURIComponent("绝对不存在的搜索词xyzzy")}`);
+    assert.strictEqual(searchMiss.body.results.length, 0);
+    passed++; console.log("  ✓ /api/session/search: 文本命中按会话分组 + 空白 q 400 + 无命中空结果");
+
+    // 导出返回附件(非 JSON)→ 原始 GET
+    const rawGet = (url) =>
+      new Promise((resolve, reject) => {
+        http.get(`${BASE}${url}`, { headers: { "x-auth-token": TOKEN } }, (res) => {
+          let d = "";
+          const h = res.headers;
+          res.on("data", (c) => (d += c));
+          res.on("end", () => resolve({ status: res.statusCode, body: d, headers: h }));
+        }).on("error", reject);
+      });
+    const md17 = await rawGet(`/api/session/export?sessionId=${encodeURIComponent(sessA)}&format=markdown`);
+    assert.strictEqual(md17.status, 200);
+    assert.ok(md17.body.includes(`# agent-harness 会话导出: ${sessA}`));
+    assert.ok(md17.body.includes("## 👤 用户") && md17.body.includes("### ⚙ 工具调用: Bash"), "markdown 分节渲染");
+    assert.ok(/attachment; filename=".*\.md"/.test(md17.headers["content-disposition"] || ""), "附件下载头");
+    const jl17 = await rawGet(`/api/session/export?sessionId=${encodeURIComponent(sessA)}&format=jsonl`);
+    assert.strictEqual(jl17.status, 200);
+    assert.strictEqual(jl17.body, fs.readFileSync(path.join(ROOT, ".agent-harness", "sessions", `${sessA}.jsonl`), "utf8"), "jsonl 原文逐字");
+    const ex404 = await fetchJson("GET", "/api/session/export?sessionId=nope&format=markdown");
+    assert.strictEqual(ex404.status, 404);
+    passed++; console.log("  ✓ /api/session/export: markdown 分节 + jsonl 原文 + 附件头 + 404");
+
+    const fork17 = await fetchJson("POST", "/api/session/fork", { sessionId: sessA });
+    assert.strictEqual(fork17.status, 200);
+    assert.ok(fork17.body.sessionId.startsWith("sess_fork_"), `fork id: ${fork17.body.sessionId}`);
+    assert.strictEqual(fork17.body.sourceId, sessA);
+    assert.ok(fork17.body.messages >= 6, "完整 fork 保留全部消息(一轮含 tool_use/result 共 6 条)");
+    const forkHist = await fetchJson("GET", `/api/session/history?sessionId=${encodeURIComponent(fork17.body.sessionId)}`);
+    assert.strictEqual(forkHist.status, 200, "fork 会话自动激活 → history 可回放");
+    assert.ok(forkHist.body.events.some((e) => e.kind === "user_message"), "fork 回放含用户消息");
+    const forkUp = await fetchJson("POST", "/api/session/fork", { sessionId: sessA, upto: 2 });
+    assert.strictEqual(forkUp.status, 200);
+    assert.strictEqual(forkUp.body.messages, 2, "upto 截断前 2 条");
+    const fork404 = await fetchJson("POST", "/api/session/fork", { sessionId: "nope" });
+    assert.strictEqual(fork404.status, 404);
+    const forkBad = await fetchJson("POST", "/api/session/fork", { sessionId: sessA, upto: 0 });
+    assert.strictEqual(forkBad.status, 400);
+    passed++; console.log("  ✓ /api/session/fork: 完整/upto 复制 + 自动激活 + 404/400");
+
     // 18. 分层配置 e2e: 独立 spawn(AGENT_HARNESS_HOME 指向含用户级 allow 规则的临时目录)→
     //     date 未命中项目级规则, 被用户级 Bash(date:*) 跨层放行 → 全程无弹窗。
     //     独立端口 + 独立 provider → 不影响既有 17 个测试的 mock 轮次记账
@@ -788,6 +851,93 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     sse21.close();
     server5.kill("SIGTERM");
     fs.rmSync(home21, { recursive: true, force: true });
+
+    // 22. Edit 快照持久化 + 崩溃重启 resume 恢复 e2e(P2b): 独立 spawn(显式 mock: 轮1 Read)→
+    //     Read 后 filestate 随 markRead 同步落盘 → SIGKILL 模拟崩溃 → 同 cwd 重启(新 mock: 轮1 Edit)→
+    //     resume 同会话(快照 load)→ Edit 免重新 Read 直接过 + 编辑真实落盘。
+    //     项目级规则 allow Edit → 全程无弹窗(demo/settings.json)
+    const PORT6 = 3994;
+    const BASE6 = `http://127.0.0.1:${PORT6}`;
+    const home22 = fs.mkdtempSync(path.join(os.tmpdir(), "web-smoke-home22-"));
+    const file22 = path.join(home22, "snapshot.txt");
+    fs.writeFileSync(file22, "alpha beta gamma\n", "utf8");
+    const spawn22 = (mockScript) => {
+      const s = spawn("node", ["dist/cli.js", "web"], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          ANTHROPIC_API_KEY: "",
+          PORT: String(PORT6),
+          AUTH_TOKEN: TOKEN,
+          AGENT_HARNESS_NO_KEYCHAIN: "1",
+          AGENT_HARNESS_HOME: home22,
+          AGENT_HARNESS_MOCK_SCRIPT: JSON.stringify(mockScript),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      s.stderr.on("data", () => {}); // 启动横幅噪音不收集
+      return s;
+    };
+    let server6 = spawn22([
+      { toolUses: [{ name: "Read", input: { path: file22 } }] },
+      { text: "已读取文件。" },
+    ]);
+    let up6 = false;
+    for (let i = 0; i < 40 && !up6; i++) {
+      await sleep(250);
+      try {
+        await fetchJson("GET", "/api/sessions", undefined, TOKEN, BASE6);
+        up6 = true;
+      } catch { /* 等待启动 */ }
+    }
+    assert.ok(up6, "Edit 快照 e2e 服务器(a)未启动");
+    let sse22 = sseCollect(TOKEN, BASE6);
+    const ready22 = await sse22.waitFor((e) => e.kind === "ready");
+    const sess22 = ready22.sessionId;
+    const mark22 = sse22.events.length;
+    await fetchJson("POST", "/api/message", { text: "读文件", sessionId: sess22 }, TOKEN, BASE6);
+    const read22 = await sse22.waitFor((e) => e.kind === "tool_start" && e.name === "Read", 15000, mark22);
+    await sse22.waitFor((e) => e.kind === "tool_result" && e.id === read22.id && !e.isError, 15000, mark22);
+    await sse22.waitFor((e) => e.kind === "stop", 15000, mark22);
+    const statePath22 = path.join(ROOT, ".agent-harness", "sessions", `${sess22}.filestate.json`);
+    assert.ok(fs.existsSync(statePath22), "filestate 应随 markRead 同步落盘");
+    const state22 = JSON.parse(fs.readFileSync(statePath22, "utf8"));
+    assert.strictEqual(state22.version, 1);
+    assert.ok(state22.files[file22] && typeof state22.files[file22].mtimeMs === "number", "快照含目标文件 mtimeMs/size");
+    passed++; console.log("  ✓ Edit 快照 e2e(a): Read → filestate 同步落盘");
+    sse22.close();
+    server6.kill("SIGKILL"); // 模拟崩溃: 不给优雅清理机会
+    await new Promise((r) => server6.on("exit", r));
+
+    // (b) 重启: 同 cwd → 同 sessions 目录; 新 provider mock 从轮 1 起(Edit)→ resume → 快照恢复
+    server6 = spawn22([
+      { toolUses: [{ name: "Edit", input: { path: file22, old_string: "beta", new_string: "BETA" } }] },
+      { text: "已编辑。" },
+    ]);
+    let up6b = false;
+    for (let i = 0; i < 40 && !up6b; i++) {
+      await sleep(250);
+      try {
+        await fetchJson("GET", "/api/sessions", undefined, TOKEN, BASE6);
+        up6b = true;
+      } catch { /* 等待启动 */ }
+    }
+    assert.ok(up6b, "Edit 快照 e2e 服务器(b)未启动");
+    sse22 = sseCollect(TOKEN, BASE6);
+    await sse22.waitFor((e) => e.kind === "ready");
+    const resume22 = await fetchJson("POST", "/api/session/resume", { sessionId: sess22 }, TOKEN, BASE6);
+    assert.strictEqual(resume22.status, 200);
+    const mark22b = sse22.events.length;
+    await fetchJson("POST", "/api/message", { text: "改文件", sessionId: sess22 }, TOKEN, BASE6);
+    const edit22 = await sse22.waitFor((e) => e.kind === "tool_start" && e.name === "Edit", 15000, mark22b);
+    const editRes22 = await sse22.waitFor((e) => e.kind === "tool_result" && e.id === edit22.id, 15000, mark22b);
+    assert.ok(!editRes22.isError, `resume 恢复快照后 Edit 应免重新 Read 直接过: ${editRes22.output}`);
+    await sse22.waitFor((e) => e.kind === "stop", 15000, mark22b);
+    assert.strictEqual(fs.readFileSync(file22, "utf8"), "alpha BETA gamma\n", "编辑真实落盘");
+    passed++; console.log("  ✓ Edit 快照 e2e(b): 崩溃重启 + resume → Edit 免重新 Read 直接过");
+    sse22.close();
+    server6.kill("SIGTERM");
+    fs.rmSync(home22, { recursive: true, force: true });
 
     sse.close();
     fs.rmSync(emptyHome, { recursive: true, force: true });

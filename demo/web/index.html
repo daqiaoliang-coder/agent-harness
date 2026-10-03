@@ -32,12 +32,33 @@
   #new-session:hover { filter: brightness(1.1); }
   #sessions { flex: 1; overflow-y: auto; }
   #sessions h3 { font-size: 11px; color: var(--dim); text-transform: uppercase; padding: 6px; letter-spacing: .05em; }
+  #sess-search {
+    width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: 7px;
+    color: var(--text); font: 11px var(--mono); padding: 6px 8px; outline: 0; margin-bottom: 4px;
+  }
+  #sess-search:focus { border-color: var(--accent); }
+  #sess-search::placeholder { color: var(--dim); }
   .sess {
     padding: 7px 9px; border-radius: 7px; cursor: pointer; font-size: 12px;
-    font-family: var(--mono); color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-family: var(--mono); color: var(--dim); position: relative; margin-bottom: 2px;
   }
-  .sess:hover { background: var(--bg3); color: var(--text); }
-  .sess.active { background: var(--bg3); color: var(--accent); }
+  .sess:hover { background: var(--bg3); }
+  .sess.active { background: var(--bg3); }
+  .sess-title { color: var(--text); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 46px; }
+  .sess.active .sess-title { color: var(--accent); }
+  .sess-meta { font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess-btns { position: absolute; right: 6px; top: 6px; display: none; gap: 4px; }
+  .sess:hover .sess-btns { display: inline-flex; }
+  .sess-btn {
+    background: var(--bg2); border: 1px solid var(--border); color: var(--dim); border-radius: 5px;
+    font: 10px/1.5 var(--mono); padding: 1px 6px; cursor: pointer;
+  }
+  .sess-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .search-hit {
+    font-family: var(--mono); font-size: 10px; color: var(--dim); padding: 2px 9px 2px 22px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer;
+  }
+  .search-hit:hover { color: var(--text); }
   /* ── 主区 ── */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #topbar {
@@ -185,7 +206,10 @@
   <nav id="sidebar">
     <div id="logo">agent-harness<small>harness web</small></div>
     <button id="new-session">＋ 新会话</button>
-    <div id="sessions"><h3>会话</h3><div id="sess-list"></div></div>
+    <div id="sessions">
+      <input id="sess-search" type="text" placeholder="搜索会话内容… (Enter)">
+      <h3>会话</h3><div id="sess-list"></div>
+    </div>
   </nav>
   <main id="main">
     <div id="topbar">
@@ -475,31 +499,106 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && permShowing) answerPerm("no");
 });
 
-// ── 会话列表 ──
+// ── 会话列表(标题/搜索/fork/导出) ──
+let searchView = false; // 搜索结果视图: 抑制 refreshSessions 重绘(避免覆盖搜索结果)
 async function refreshSessions() {
+  if (searchView) return;
   try {
     const r = await api("/api/sessions");
     const d = await r.json();
-    const list = $("sess-list");
-    list.textContent = "";
-    for (const s of d.sessions.slice(0, 30)) {
-      const n = el("div", "sess" + (s.id === activeSess ? " active" : ""),
-        s.id.replace(/^sess_/, "") + " · " + new Date(s.mtime).toLocaleString());
-      n.onclick = async () => {
-        if (s.id === activeSess) return;
-        try {
-          const r = await api("/api/session/resume", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ sessionId: s.id }),
-          });
-          const d = await r.json();
-          if (d.sessionId) await activateSession(d.sessionId);
-        } catch (e) { sysLine("error", `✖ 切换会话失败: ${e.message}`); }
-      };
-      list.appendChild(n);
-    }
+    renderSessionList(d.sessions.slice(0, 30));
   } catch { /* 服务未就绪时静默 */ }
 }
+function renderSessionList(sessions) {
+  const list = $("sess-list");
+  list.textContent = "";
+  for (const s of sessions) {
+    const n = el("div", "sess" + (s.id === activeSess ? " active" : ""));
+    // 行内小按钮(悬停显示): fork 复制消息树为新会话 | 导出 markdown 下载
+    const btns = el("span", "sess-btns");
+    const forkBtn = el("button", "sess-btn", "⎇");
+    forkBtn.title = "fork 此会话(完整消息树复制为新会话)";
+    forkBtn.onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        const r = await api("/api/session/fork", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: s.id }),
+        });
+        const d = await r.json();
+        if (d.sessionId) { searchView = false; await activateSession(d.sessionId); }
+        else sysLine("error", `✖ fork 失败: ${d.error ?? "未知错误"}`);
+      } catch (e) { sysLine("error", `✖ fork 失败: ${e.message}`); }
+    };
+    const expBtn = el("button", "sess-btn", "⬇");
+    expBtn.title = "导出 markdown";
+    expBtn.onclick = (e) => {
+      e.stopPropagation();
+      // 附件下载: 隐式 <a> 点击(SSE 同款 ?token= 查询参数鉴权)
+      const a = document.createElement("a");
+      a.href = `/api/session/export?sessionId=${encodeURIComponent(s.id)}&format=markdown&token=${encodeURIComponent(TOKEN)}`;
+      document.body.appendChild(a); a.click(); a.remove();
+    };
+    btns.appendChild(forkBtn); btns.appendChild(expBtn);
+    n.appendChild(btns);
+    n.appendChild(el("div", "sess-title", s.title || s.id.replace(/^sess_/, "")));
+    n.appendChild(el("div", "sess-meta", `${s.id.replace(/^sess_/, "")} · ${new Date(s.mtime).toLocaleString()}`));
+    n.onclick = () => switchSession(s.id);
+    list.appendChild(n);
+  }
+}
+// 会话切换(resume 通道: 已激活仅切换视图, 落盘会话冷激活)
+async function switchSession(id) {
+  if (id === activeSess) return;
+  try {
+    const r = await api("/api/session/resume", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: id }),
+    });
+    const d = await r.json();
+    if (d.sessionId) { searchView = false; await activateSession(d.sessionId); }
+  } catch (e) { sysLine("error", `✖ 切换会话失败: ${e.message}`); }
+}
+// ── 跨会话搜索: 结果按会话分组(标题 + 命中摘要), 点击任意行切换 ──
+async function runSessionSearch(q) {
+  if (!q.trim()) return clearSessionSearch();
+  try {
+    const r = await api(`/api/session/search?q=${encodeURIComponent(q)}`);
+    const d = await r.json();
+    searchView = true;
+    const list = $("sess-list");
+    list.textContent = "";
+    const back = el("div", "sess", "← 返回会话列表");
+    back.onclick = clearSessionSearch;
+    list.appendChild(back);
+    if (!d.results.length) {
+      list.appendChild(el("div", "sess-meta", `无匹配「${q}」的会话`));
+      return;
+    }
+    for (const res of d.results) {
+      const g = el("div", "sess" + (res.sessionId === activeSess ? " active" : ""));
+      g.appendChild(el("div", "sess-title", res.title || res.sessionId));
+      g.appendChild(el("div", "sess-meta", `${res.sessionId.replace(/^sess_/, "")} · ${res.hits.length} 处命中`));
+      g.onclick = () => switchSession(res.sessionId);
+      list.appendChild(g);
+      for (const h of res.hits) {
+        const hit = el("div", "search-hit", `${h.role === "user" ? "问" : "答"}  ${h.snippet}`);
+        hit.title = h.snippet;
+        hit.onclick = () => switchSession(res.sessionId);
+        list.appendChild(hit);
+      }
+    }
+  } catch (e) { sysLine("error", `✖ 搜索失败: ${e.message}`); }
+}
+function clearSessionSearch() {
+  searchView = false;
+  $("sess-search").value = "";
+  refreshSessions();
+}
+$("sess-search").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); runSessionSearch($("sess-search").value); }
+  if (e.key === "Escape") clearSessionSearch();
+});
 // 会话切换(多会话并发): 从 POST 响应立即锁定视图, 再显式拉取该会话回放
 // (确定性时序, 不依赖 SSE 广播与 fetch 的到达顺序); 附挂起弹窗与 running 态恢复
 async function activateSession(id) {

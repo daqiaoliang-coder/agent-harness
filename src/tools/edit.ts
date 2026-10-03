@@ -5,7 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { ToolResult } from "../types";
 import { Tool } from "./tool";
-import { checkFreshness, markWritten, withFileLock } from "./fileState";
+import { FileStateStore, defaultFileStateStore, withFileLock } from "./fileState";
 
 // 单条编辑(normalize 后的内部形状; replace_all 可按条覆写)
 export interface EditItem {
@@ -70,6 +70,13 @@ export class EditTool implements Tool {
     return { decision: null };
   }
 
+  private readonly store: FileStateStore;
+
+  // store 注入: 每会话独立快照(同 ReadTool; 缺省共享单例沿用旧语义)
+  constructor(opts: { store?: FileStateStore } = {}) {
+    this.store = opts.store ?? defaultFileStateStore();
+  }
+
   async execute(input: Record<string, unknown>): Promise<ToolResult> {
     // 文件级互斥: 读-新鲜度校验-写 必须原子(并行工具调用下防同文件写-写竞态)
     return withFileLock(path.resolve(String(input.path ?? "")), () => this.run(input));
@@ -131,7 +138,7 @@ export class EditTool implements Tool {
     }
 
     // 先读后改 + 新鲜度校验
-    const fresh = checkFreshness(p);
+    const fresh = this.store.checkFreshness(p);
     if (fresh === "unread") {
       return {
         content: `File has not been read yet: ${p}\n请先用 Read 工具读取该文件, 再进行 Edit。`,
@@ -170,7 +177,7 @@ export class EditTool implements Tool {
     }
 
     fs.writeFileSync(p, r.content, "utf8");
-    markWritten(p);
+    this.store.markWritten(p);
 
     // 结果摘要: 多编辑逐条计数 + 末条预览; 单编辑保持既有文案
     const total = r.counts.reduce((a, b) => a + b, 0);

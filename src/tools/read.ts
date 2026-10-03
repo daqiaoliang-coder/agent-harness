@@ -2,7 +2,7 @@
 import * as fs from "fs";
 import { ToolResult } from "../types";
 import { Tool } from "./tool";
-import { markRead } from "./fileState";
+import { FileStateStore, defaultFileStateStore } from "./fileState";
 
 const MAX_READ_CHARS = 100_000;
 
@@ -17,6 +17,13 @@ export class ReadTool implements Tool {
     required: ["path"],
   };
 
+  private readonly store: FileStateStore;
+
+  // store 注入: 每会话独立快照(Web 多会话防跨会话泄漏 + resume 持久化); 缺省共享单例(直调/测试沿用旧语义)
+  constructor(opts: { store?: FileStateStore } = {}) {
+    this.store = opts.store ?? defaultFileStateStore();
+  }
+
   checkPermissions() {
     // 只读工具 → 瀑布第②层直接放行
     return { decision: "allow" as const, reason: "Read 为只读工具" };
@@ -27,7 +34,7 @@ export class ReadTool implements Tool {
     if (!p) return { content: "参数错误: path 不能为空", isError: true };
     try {
       const content = fs.readFileSync(p, "utf8");
-      markRead(p); // 记录快照(mtime+size), 供 Edit 做先读后改/新鲜度校验
+      this.store.markRead(p); // 记录快照(mtime+size), 供 Edit 做先读后改/新鲜度校验
       return {
         content: content.length > MAX_READ_CHARS ? content.slice(0, MAX_READ_CHARS) + "\n[truncated]" : content,
       };

@@ -1,7 +1,7 @@
 // Web 模式: 零依赖(http + SSE) — 引擎与浏览器的桥接层。
 //   GET  /                      → 单页前端(demo/web/index.html)
 //   GET  /api/events            → SSE 事件流(ready/history + 实时 UiEvent, 全部带 sessionId 标记)
-//   GET  /api/sessions          → 会话列表(transcript *.jsonl)
+//   GET  /api/sessions          → 会话列表(transcript *.jsonl; 标题 = 首条用户消息实时派生)
 //   GET  /api/session/history   → 指定活动会话回放(?sessionId= → 消息树事件 + 挂起弹窗 + running 态)
 //   GET  /api/stats             → 错误遥测汇总(错误分类计数 + 活动会话轮次/token 用量)
 //   GET  /api/usage             → 用量仪表盘(5h 滚动窗口聚合 + 活动会话实时累计; /usage 命令同源)
@@ -9,6 +9,9 @@
 //   POST /api/permission/:id    → 权限弹窗应答(resolve 挂起的 userResponder Promise)
 //   POST /api/abort             → 中断指定会话当前运行({sessionId?}; 仅冲洗目标会话的挂起弹窗)
 //   POST /api/session/new       → 新会话 | POST /api/session/resume {sessionId} → 恢复(已在活动表则仅切换)
+//   GET  /api/session/search    → 跨会话搜索(?q= 子串; 只搜用户/assistant 文本块, 按会话分组返回摘要)
+//   GET  /api/session/export    → 导出会话(?sessionId=&format=markdown|jsonl; 附件下载, 任意落盘会话无需激活)
+//   POST /api/session/fork      → fork 会话({sessionId, upto?} → 复制消息树为新会话并激活; 见 session/list)
 // 多会话模型: Map<sessionId, Live>(激活即移尾 = LRU; 上限 8, 超限驱逐最旧 — close+冲洗弹窗, transcript 保留可再 resume)。
 //   每会话独立 sendChain(会话内串行, 跨会话并发)与独立 AbortController;
 //   SSE 事件按 sessionId 标记广播, 前端按当前视图过滤 → 多标签页可各自查看不同会话。
@@ -39,6 +42,13 @@ import {
 import { PRODUCTION_COMPACT_CONFIG, computeWatermarks } from "../compact/watermarks";
 import { MergedSettings, composeSystemPrompt, resolveModel } from "../settings/loader";
 import { loadProjectMemory } from "../settings/memory";
+import {
+  listSessions,
+  searchSessions,
+  exportSessionMarkdown,
+  exportSessionJsonl,
+  forkTranscript,
+} from "../session/list";
 
 const PORT = Number(process.env.PORT ?? 3218);
 // 默认只绑定回环地址: 未鉴权的局域网暴露 = 任何人可发消息/替答权限弹窗(= 远程授权任意 Bash)
@@ -316,14 +326,7 @@ function json(res: http.ServerResponse, code: number, body: unknown): void {
   res.end(payload);
 }
 
-function listSessions(): Array<{ id: string; mtime: number }> {
-  if (!fs.existsSync(SESSIONS_DIR)) return [];
-  return fs
-    .readdirSync(SESSIONS_DIR)
-    .filter((f) => f.endsWith(".jsonl"))
-    .map((f) => ({ id: f.replace(/\.jsonl$/, ""), mtime: fs.statSync(path.join(SESSIONS_DIR, f)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-}
+// listSessions/searchSessions/export*/forkTranscript 由 session/list.ts 提供(与 CLI sessions 子命令同源)
 
 // 鉴权: header x-auth-token 或 query ?token= (SSE/EventSource 只能用 query)
 function isAuthorized(req: http.IncomingMessage, query: URLSearchParams): boolean {
@@ -407,7 +410,34 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 
   if (req.method === "GET" && url === "/api/sessions") {
-    json(res, 200, { sessions: listSessions() });
+    json(res, 200, { sessions: listSessions(SESSIONS_DIR) });
+    return;
+  }
+
+  // 跨会话搜索: 大小写不敏感子串; 只搜用户输入与 assistant 文本块(工具 I/O 不入结果)
+  if (req.method === "GET" && url === "/api/session/search") {
+    const q = urlObj.searchParams.get("q") ?? "";
+    if (!q.trim()) return json(res, 400, { error: "q 不能为空" });
+    return json(res, 200, searchSessions(SESSIONS_DIR, q));
+  }
+
+  // 导出(任意落盘会话, 无需激活): format=markdown(默认, 人类可读) | jsonl(原始 transcript)
+  if (req.method === "GET" && url === "/api/session/export") {
+    const id = (urlObj.searchParams.get("sessionId") ?? "").replace(/\.jsonl$/, "");
+    if (!id || !fs.existsSync(path.join(SESSIONS_DIR, `${id}.jsonl`))) {
+      return json(res, 404, { error: `会话不存在: ${id}` });
+    }
+    const format = urlObj.searchParams.get("format") === "jsonl" ? "jsonl" : "markdown";
+    try {
+      const body = format === "jsonl" ? exportSessionJsonl(SESSIONS_DIR, id) : exportSessionMarkdown(SESSIONS_DIR, id);
+      res.writeHead(200, {
+        "Content-Type": format === "jsonl" ? "application/jsonl; charset=utf-8" : "text/markdown; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${id}.${format === "jsonl" ? "jsonl" : "md"}"`,
+      });
+      res.end(body);
+    } catch (e) {
+      json(res, 500, { error: (e as Error).message });
+    }
     return;
   }
 
@@ -436,7 +466,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return json(res, 200, {
       since: t.since,
       errors: t.errorStats,
-      sessions: { live: liveSessions.size, recorded: listSessions().length },
+      sessions: { live: liveSessions.size, recorded: listSessions(SESSIONS_DIR).length },
       liveSessions: [...liveSessions.values()].map((l) => ({
         id: l.id,
         model: l.meta.model,
@@ -534,6 +564,31 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const sessionId = await activateSession({ resumeId: id });
     return json(res, 200, { ok: true, sessionId });
+  }
+
+  // fork: 复制 transcript(可截断至前 upto 条消息)开新会话并激活; 崩溃一致性由激活时的 repair 兜底
+  if (req.method === "POST" && url === "/api/session/fork") {
+    const body = await readBody(req);
+    const srcId = typeof body.sessionId === "string" ? body.sessionId.replace(/\.jsonl$/, "") : "";
+    if (!srcId || !fs.existsSync(path.join(SESSIONS_DIR, `${srcId}.jsonl`))) {
+      return json(res, 404, { error: `源会话不存在: ${srcId}` });
+    }
+    let upto: number | undefined;
+    if (body.upto !== undefined && body.upto !== null) {
+      const n = Number(body.upto);
+      if (!Number.isInteger(n) || n < 1) {
+        return json(res, 400, { error: `upto 须为 ≥1 的整数(保留前 N 条消息; 收到 ${JSON.stringify(body.upto)})` });
+      }
+      upto = n;
+    }
+    const newId = `sess_fork_${Date.now()}_${++webSessSeq}`;
+    try {
+      const forked = forkTranscript(SESSIONS_DIR, srcId, newId, { upto });
+      const sessionId = await activateSession({ resumeId: forked.id });
+      return json(res, 200, { ok: true, sessionId, messages: forked.messages, sourceId: srcId });
+    } catch (e) {
+      return json(res, 500, { error: `fork 失败: ${(e as Error).message}` });
+    }
   }
 
   json(res, 404, { error: `未路由: ${req.method} ${url}` });

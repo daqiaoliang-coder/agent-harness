@@ -33,6 +33,8 @@ const { resolveLayerPaths, mergeSettings, loadMergedSettings, composeSystemPromp
 const { dispatchSlashCommand, PLAN_MODE_SUFFIX } = require("../dist/commands");
 const { createSession, SESSIONS_DIR } = require("../dist/cli");
 const { estimateTokens } = require("../dist/context/tokenEstimator");
+const { deriveTitle, listSessions, searchSessions, exportSessionMarkdown, exportSessionJsonl, forkTranscript } = require("../dist/session/list");
+const { FileStateStore } = require("../dist/tools/fileState");
 
 let passed = 0;
 async function test(name, fn) {
@@ -2711,6 +2713,166 @@ exit 1
     assert.ok(blocked.isError && blocked.content.includes("File has not been read yet"), blocked.content);
     fs.rmSync(dirP18, { recursive: true, force: true });
   });
+
+  // ---------- Part 19: 会话管理共享层(标题/搜索/导出/fork)+ fileState 持久化(P2b) ----------
+  console.log("[19] 会话管理(list/search/export/fork)+ fileState 持久化");
+  const dirP19 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-sess-"));
+  const wLines = (id, lines) => fs.writeFileSync(path.join(dirP19, `${id}.jsonl`), lines.join("\n") + "\n", "utf8");
+  const uLine = (text) => JSON.stringify({ ts: "2026-01-01T00:00:00Z", role: "user", content: [{ type: "text", text }] });
+  const aLine = (text) => JSON.stringify({ ts: "2026-01-01T00:00:01Z", role: "assistant", content: [{ type: "text", text }] });
+  const tUse = (id, name, input) => JSON.stringify({ role: "assistant", content: [{ type: "tool_use", id, name, input }] });
+  const tRes = (id, content, isError) => JSON.stringify({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: !!isError }] });
+
+  wLines("sess_alpha", [
+    uLine("关于部署方案的取舍, 想听听建议"),
+    aLine("背景补充: " + "x".repeat(120) + " 滚动发布 bluegreen 是首选 " + "y".repeat(120)),
+    tUse("tu_1", "Bash", { command: "kubectl get pods" }),
+    tRes("tu_1", "NAME READY\nweb-1 1/1", false),
+    uLine("第二问: 预算约束下呢"),
+  ]);
+  wLines("sess_long", [uLine("超长标题测试".repeat(12))]); // 72 字 > 60 上限 → 截断 + …
+  wLines("sess_toolfirst", [tRes("tu_x", "崩溃修复补齐的孤儿 tool_result 首行", true), uLine("修复补齐后的真实用户输入")]);
+  wLines("sess_empty", [aLine("只有助手消息没有用户输入")]);
+  wLines("sess_multi", Array.from({ length: 8 }, (_, i) => uLine(`第 ${i + 1} 次提到目标词`)));
+  // 强制可辨 mtime(listSessions 按新→旧排序)
+  fs.utimesSync(path.join(dirP19, "sess_alpha.jsonl"), new Date("2026-01-05"), new Date("2026-01-05"));
+  fs.utimesSync(path.join(dirP19, "sess_long.jsonl"), new Date("2026-01-04"), new Date("2026-01-04"));
+  fs.utimesSync(path.join(dirP19, "sess_toolfirst.jsonl"), new Date("2026-01-03"), new Date("2026-01-03"));
+  fs.utimesSync(path.join(dirP19, "sess_empty.jsonl"), new Date("2026-01-02"), new Date("2026-01-02"));
+  fs.utimesSync(path.join(dirP19, "sess_multi.jsonl"), new Date("2026-01-01"), new Date("2026-01-01"));
+
+  await test("deriveTitle: 首条用户消息首行 + 跳过纯 tool_result 行 + 坏行", async () => {
+    assert.strictEqual(deriveTitle(path.join(dirP19, "sess_alpha.jsonl")), "关于部署方案的取舍, 想听听建议");
+    assert.strictEqual(deriveTitle(path.join(dirP19, "sess_toolfirst.jsonl")), "修复补齐后的真实用户输入");
+    // 60 字符截断(61 字 > 上限 → 前缀 + …); 坏行(非 JSON)跳过后取到用户行
+    const longTitle = deriveTitle(path.join(dirP19, "sess_long.jsonl"));
+    assert.ok(longTitle.length <= 61 && longTitle.endsWith("…"), longTitle);
+    fs.writeFileSync(path.join(dirP19, "sess_badfirst.jsonl"), "{broken json\n" + uLine("坏行之后的用户输入") + "\n", "utf8");
+    // 钉旧 mtime: 不晚于下方五会话(2026-01-*) → 不干扰 listSessions 排序断言
+    fs.utimesSync(path.join(dirP19, "sess_badfirst.jsonl"), new Date("2025-12-31"), new Date("2025-12-31"));
+    assert.strictEqual(deriveTitle(path.join(dirP19, "sess_badfirst.jsonl")), "坏行之后的用户输入");
+    assert.strictEqual(deriveTitle(path.join(dirP19, "no-such-file.jsonl")), "(不可读)");
+  });
+
+  await test("deriveTitle: 无用户消息 → (空会话)", async () => {
+    assert.strictEqual(deriveTitle(path.join(dirP19, "sess_empty.jsonl")), "(空会话)");
+  });
+
+  await test("listSessions: mtime 新→旧 + title/size 字段齐全", async () => {
+    const all = listSessions(dirP19);
+    assert.ok(all.length >= 6);
+    assert.deepStrictEqual(all.slice(0, 5).map((s) => s.id), ["sess_alpha", "sess_long", "sess_toolfirst", "sess_empty", "sess_multi"]);
+    assert.strictEqual(all[0].title, "关于部署方案的取舍, 想听听建议");
+    assert.ok(all[0].size > 0 && all[0].mtime > 0);
+  });
+
+  await test("searchSessions: 大小写不敏感 + snippet 带省略号上下文", async () => {
+    const { query, results } = searchSessions(dirP19, "BLUEGREEN");
+    assert.strictEqual(query, "BLUEGREEN");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].sessionId, "sess_alpha");
+    assert.strictEqual(results[0].hits[0].role, "assistant");
+    assert.ok(results[0].hits[0].snippet.startsWith("…") && results[0].hits[0].snippet.endsWith("…"), results[0].hits[0].snippet);
+    assert.ok(results[0].hits[0].snippet.includes("bluegreen"));
+  });
+
+  await test("searchSessions: 只搜文本块 — 工具 I/O 命中不算", async () => {
+    // "kubectl" 只出现在 tool_use.input 与 tool_result.content → 不入结果
+    assert.strictEqual(searchSessions(dirP19, "kubectl").results.length, 0);
+    // "崩溃修复" 只在 tool_result 内容 → 同样不命中
+    assert.strictEqual(searchSessions(dirP19, "崩溃修复").results.length, 0);
+  });
+
+  await test("searchSessions: 空/空白 q → 空 results; 每会话命中 ≤5", async () => {
+    assert.strictEqual(searchSessions(dirP19, "").results.length, 0);
+    assert.strictEqual(searchSessions(dirP19, "   ").results.length, 0);
+    const { results } = searchSessions(dirP19, "目标词");
+    assert.strictEqual(results.length, 1);
+    assert.strictEqual(results[0].hits.length, 5, "8 次出现 → 截断到 5");
+    assert.ok(results[0].hits.every((h) => h.role === "user"));
+  });
+
+  await test("exportSessionMarkdown: 分节渲染 + 工具调用/结果 + 长结果截断", async () => {
+    // 长工具结果(>2000 chars)专检
+    wLines("sess_big", [uLine("跑个大输出"), tUse("tu_9", "Bash", { command: "cat big.log" }), tRes("tu_9", "Z".repeat(3000), false), aLine("分析完毕")]);
+    const md = exportSessionMarkdown(dirP19, "sess_big");
+    assert.ok(md.includes("# agent-harness 会话导出: sess_big"));
+    assert.ok(md.includes("## 👤 用户") && md.includes("## 🤖 助手"));
+    assert.ok(md.includes("### ⚙ 工具调用: Bash"));
+    assert.ok(md.includes("<details><summary>↳ 工具结果</summary>"));
+    assert.ok(md.includes("…(截断, 共 3000 字符)"), "2000 字符预览截断标注");
+    // 错误结果标记
+    const mdErr = exportSessionMarkdown(dirP19, "sess_toolfirst");
+    assert.ok(mdErr.includes("↳ 工具结果(错误)"));
+    assert.throws(() => exportSessionMarkdown(dirP19, "no-such"), /会话不存在/);
+  });
+
+  await test("exportSessionJsonl: 原文逐字返回", async () => {
+    const raw = exportSessionJsonl(dirP19, "sess_empty");
+    assert.strictEqual(raw, fs.readFileSync(path.join(dirP19, "sess_empty.jsonl"), "utf8"));
+    assert.throws(() => exportSessionJsonl(dirP19, "no-such"), /会话不存在/);
+  });
+
+  await test("forkTranscript: 完整复制 + 坏行不复制", async () => {
+    fs.writeFileSync(path.join(dirP19, "sess_dirty.jsonl"), uLine("第一条") + "\n{broken\n" + aLine("第二条") + "\n", "utf8");
+    const r = forkTranscript(dirP19, "sess_dirty", "sess_fork1");
+    assert.strictEqual(r.messages, 2);
+    const lines = fs.readFileSync(path.join(dirP19, "sess_fork1.jsonl"), "utf8").trim().split("\n");
+    assert.strictEqual(lines.length, 2);
+    assert.strictEqual(JSON.parse(lines[0]).content[0].text, "第一条");
+  });
+
+  await test("forkTranscript: upto 截断 + 源不存在/目标已存在 → throw", async () => {
+    const r = forkTranscript(dirP19, "sess_alpha", "sess_fork2", { upto: 3 });
+    assert.strictEqual(r.messages, 3);
+    assert.strictEqual(fs.readFileSync(path.join(dirP19, "sess_fork2.jsonl"), "utf8").trim().split("\n").length, 3);
+    assert.throws(() => forkTranscript(dirP19, "no-such", "x"), /源会话不存在/);
+    assert.throws(() => forkTranscript(dirP19, "sess_alpha", "sess_fork2"), /目标会话已存在/);
+  });
+
+  await test("FileStateStore: markRead/markWritten + freshness(ok/stale/unread)", async () => {
+    const f = path.join(dirP19, "fs.txt");
+    fs.writeFileSync(f, "hello\n", "utf8");
+    const store = new FileStateStore();
+    assert.strictEqual(store.checkFreshness(f), "unread");
+    store.markRead(f);
+    assert.strictEqual(store.checkFreshness(f), "ok");
+    fs.writeFileSync(f, "hello world longer\n", "utf8"); // size 变化 → 必 stale
+    assert.strictEqual(store.checkFreshness(f), "stale");
+    store.markWritten(f);
+    assert.strictEqual(store.checkFreshness(f), "ok");
+    assert.strictEqual(store.checkFreshness(path.join(dirP19, "never.txt")), "unread");
+    assert.strictEqual(store.size(), 1);
+  });
+
+  await test("FileStateStore: persistTo 落盘 + 新实例 load() 恢复(跨进程 resume 语义)", async () => {
+    const f = path.join(dirP19, "persist.txt");
+    fs.writeFileSync(f, "data\n", "utf8");
+    const persistPath = path.join(dirP19, "sess_x.filestate.json");
+    const s1 = new FileStateStore({ persistTo: persistPath });
+    s1.markRead(f);
+    assert.ok(fs.existsSync(persistPath), "markRead 即同步落盘");
+    // 模拟进程重启: 新实例同 persistTo → load() 恢复快照, 未变更文件直接可 Edit
+    const s2 = new FileStateStore({ persistTo: persistPath });
+    assert.ok(s2.load());
+    assert.strictEqual(s2.size(), 1);
+    assert.strictEqual(s2.checkFreshness(f), "ok");
+    fs.writeFileSync(f, "data changed\n", "utf8");
+    assert.strictEqual(s2.checkFreshness(f), "stale", "文件被动过 → 恢复的快照仍被新鲜度校验拦截");
+  });
+
+  await test("FileStateStore: load 无文件/损坏/version 不符/无 persistTo → false", async () => {
+    assert.strictEqual(new FileStateStore({ persistTo: path.join(dirP19, "nope.json") }).load(), false);
+    const bad = path.join(dirP19, "bad.filestate.json");
+    fs.writeFileSync(bad, "{oops not json", "utf8");
+    assert.strictEqual(new FileStateStore({ persistTo: bad }).load(), false);
+    const v9 = path.join(dirP19, "v9.filestate.json");
+    fs.writeFileSync(v9, JSON.stringify({ version: 99, files: {} }), "utf8");
+    assert.strictEqual(new FileStateStore({ persistTo: v9 }).load(), false, "version != 1 → 拒载");
+    assert.strictEqual(new FileStateStore().load(), false, "无 persistTo → 恒 false");
+  });
+
+  fs.rmSync(dirP19, { recursive: true, force: true });
 
   fs.rmSync(headlessHome, { recursive: true, force: true });
 

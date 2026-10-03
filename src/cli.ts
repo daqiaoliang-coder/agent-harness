@@ -24,6 +24,7 @@ import { TodoWriteTool } from "./tools/todowrite";
 import { WebSearchTool } from "./tools/websearch";
 import { WebFetchTool } from "./tools/webfetch";
 import { TaskTool } from "./tools/task";
+import { FileStateStore } from "./tools/fileState";
 import { createExploreAgent } from "./agent/subagent";
 import { loadTranscript, repairTranscript } from "./session/resume";
 import { McpServerConfig } from "./mcp/client";
@@ -153,9 +154,12 @@ export async function createSession(opts: {
 
   const tools = new ToolRegistry();
   tools.register(new BashTool());
-  tools.register(new ReadTool());
-  tools.register(new WriteTool());
-  tools.register(new EditTool());
+  // fileState 每会话独立 store: Web 多会话同进程防跨会话"虚假满足"先读后改;
+  // 持久化到 sessions/<id>.filestate.json → resume 恢复快照(freshness 仍由 mtime/size 校验兜底)
+  const fileState = new FileStateStore({ persistTo: path.join(SESSIONS_DIR, `${opts.sessionId}.filestate.json`) });
+  tools.register(new ReadTool({ store: fileState }));
+  tools.register(new WriteTool({ store: fileState }));
+  tools.register(new EditTool({ store: fileState }));
   tools.register(new GlobTool());
   tools.register(new GrepTool());
   // TodoWrite: 会话内任务清单(全量替换); 每会话独立实例 → 状态天然隔离。
@@ -223,7 +227,12 @@ export async function createSession(opts: {
     if (report.filledUses > 0 || report.droppedResults > 0) {
       logS(`[resume] 崩溃一致性修复: 补齐孤儿 tool_use ${report.filledUses} 个 | 剔除孤儿 tool_result ${report.droppedResults} 个`);
     }
-    logS("[resume] 压缩状态由水位检查派生重建; Edit 快照不恢复(需重新 Read)");
+    // Edit 快照持久化恢复: 恢复后 freshness 由 mtime/size 校验兜底(文件被动过即 stale, 需重新 Read)
+    if (fileState.load()) {
+      logS(`[resume] Edit 快照已恢复: ${fileState.size()} 个文件(未变更的可直接 Edit; 变更过的会被新鲜度校验拦截)`);
+    } else {
+      logS("[resume] 无持久化 Edit 快照(首次 resume 或旧版本会话) → 需重新 Read 才能 Edit");
+    }
     // 任务清单状态恢复: 取最后一次成功的 TodoWrite 写入(web 端快照另经 historyFromMessages 回放)
     if (todoTool.restoreFrom(repaired)) {
       logS(`[resume] 任务清单已恢复: ${todoTool.summary()}`);
@@ -849,17 +858,65 @@ async function runKeyCommand(args: string[]): Promise<void> {
   throw new Error(`未知子命令: ${sub} — 用法: node dist/cli.js key [set|get|rm|status]`);
 }
 
+// ── sessions 子命令: 会话管理(标题列表 / 跨会话搜索 / 导出) — 与 Web /api/sessions 同源(session/list.ts) ──
+//   node dist/cli.js sessions                 → 列表(id · 时间 · 标题)
+//   node dist/cli.js sessions search <关键词>  → 跨会话文本搜索(用户输入 + assistant 文本)
+//   node dist/cli.js sessions export <id> [--jsonl] [--out <file>] → markdown(默认)或原始 jsonl
+async function runSessionsCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? "list";
+  const { listSessions, searchSessions, exportSessionMarkdown, exportSessionJsonl } = await import("./session/list");
+  if (sub === "list") {
+    const sessions = listSessions(SESSIONS_DIR);
+    if (sessions.length === 0) return log(`[sessions] ${SESSIONS_DIR} 下没有会话 transcript`);
+    log(`[sessions] ${sessions.length} 个会话(按最近修改排序):`);
+    for (const s of sessions.slice(0, 30)) {
+      log(`  ${s.id}  ${new Date(s.mtime).toLocaleString()}  ${s.title}`);
+    }
+    return;
+  }
+  if (sub === "search") {
+    const q = args.slice(1).join(" ").trim();
+    if (!q) throw new Error("用法: node dist/cli.js sessions search <关键词>");
+    const { results } = searchSessions(SESSIONS_DIR, q);
+    if (results.length === 0) return log(`[sessions] 未找到与 ${JSON.stringify(q)} 相关的内容`);
+    log(`[sessions] ${JSON.stringify(q)} → ${results.length} 个会话命中:`);
+    for (const r of results) {
+      log(`  ─ ${r.sessionId}(${r.title})`);
+      for (const h of r.hits) {
+        log(`      [${h.role}${h.ts ? " " + h.ts.slice(0, 16).replace("T", " ") : ""}] ${h.snippet}`);
+      }
+    }
+    return;
+  }
+  if (sub === "export") {
+    const id = args[1];
+    if (!id) throw new Error("用法: node dist/cli.js sessions export <sessionId> [--jsonl] [--out <file>]");
+    const asJsonl = args.includes("--jsonl");
+    const outIdx = args.indexOf("--out");
+    const outFile = outIdx !== -1 ? args[outIdx + 1] : undefined;
+    const content = asJsonl ? exportSessionJsonl(SESSIONS_DIR, id) : exportSessionMarkdown(SESSIONS_DIR, id);
+    if (outFile) {
+      fs.writeFileSync(outFile, content, "utf8");
+      return log(`[sessions] 已导出 ${id} → ${outFile}(${content.length} chars, ${asJsonl ? "jsonl" : "markdown"})`);
+    }
+    process.stdout.write(content + (asJsonl ? "" : "\n"));
+    return;
+  }
+  throw new Error(`未知子命令: ${sub} — 用法: node dist/cli.js sessions [list|search <q>|export <id>]`);
+}
+
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "demo";
   if (mode === "demo") return runDemo();
   if (mode === "chat") return runChat();
   if (mode === "key") return runKeyCommand(process.argv.slice(3));
+  if (mode === "sessions") return runSessionsCommand(process.argv.slice(3));
   if (mode === "web") {
     // web 模式: SSE 服务器 + 单页前端(零依赖); lazy require 防循环依赖
     const { runWeb } = require("./web/server") as { runWeb: () => Promise<void> };
     return runWeb();
   }
-  console.error("用法: node dist/cli.js [demo|chat|web] | key [set|get|rm|status]");
+  console.error("用法: node dist/cli.js [demo|chat|web] | key [set|get|rm|status] | sessions [list|search|export]");
   process.exit(1);
 }
 
