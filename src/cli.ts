@@ -21,6 +21,8 @@ import { EditTool } from "./tools/edit";
 import { GlobTool } from "./tools/glob";
 import { GrepTool } from "./tools/grep";
 import { TodoWriteTool } from "./tools/todowrite";
+import { WebSearchTool } from "./tools/websearch";
+import { WebFetchTool } from "./tools/webfetch";
 import { TaskTool } from "./tools/task";
 import { createExploreAgent } from "./agent/subagent";
 import { loadTranscript, repairTranscript } from "./session/resume";
@@ -63,12 +65,13 @@ const DEMO_SYSTEM_PROMPT = [
 
 const CHAT_SYSTEM_PROMPT = [
   "You are agent-harness, a minimal coding agent (architecture reference implementation)。",
-  "可用工具: Bash(执行命令), Read(读文件), Edit(精确替换编辑), Write(写文件), Glob(文件名匹配), Grep(内容搜索), TodoWrite(任务清单), Task(只读子代理调查)。",
+  "可用工具: Bash(执行命令), Read(读文件), Edit(精确替换编辑, 多处修改用 edits 数组一次原子完成), Write(写文件), Glob(文件名匹配), Grep(内容搜索), TodoWrite(任务清单), Task(只读子代理调查), WebSearch(联网搜索), WebFetch(抓取网页转文本)。",
   "多步任务(≥3 步)先用 TodoWrite 建清单: 恰好保持一项 in_progress, 步骤状态变化时立即更新, 全部完成后标尽; 清单为全量替换(每次传完整清单)。",
   "查找文件优先用 Glob/Grep(只读免确认), 而非 Bash 的 find/grep。",
   "大范围调查类任务(如\"梳理某机制的所有相关文件\")用 Task 派发子代理, 独立上下文省 token。",
+  "需要联网资料时: WebSearch 搜索, WebFetch 抓取具体网页(自动转文本; 内网/元数据地址会被拒绝)。",
   "查看与修改文件用 Read/Edit/Write, 不要用 Bash 的 sed/echo 重定向改文件。",
-  "Edit 必须先 Read 目标文件, 且 old_string 要逐字符精确匹配(含缩进)。",
+  "Edit 必须先 Read 目标文件, 且 old_string 要逐字符精确匹配(含缩进); 同文件多处修改用 edits 数组(按序应用, 任一条失败整体不落盘)。",
   "Hook 反馈视作用户本人反馈; 收到 hook-blocking-error 或 permission denied 后换一种方法。",
   "上下文接近水位时压缩管线(T0-T5)自动介入, 无需关心。",
 ].join("\n");
@@ -162,6 +165,10 @@ export async function createSession(opts: {
     log: logS,
   });
   tools.register(todoTool);
+  // WebSearch: 联网搜索(只读网络操作, 静态 allow 免弹窗); 默认 DuckDuckGo, searchFn 注入式可替换(测试/换后端)
+  tools.register(new WebSearchTool({ log: logS }));
+  // WebFetch: 抓取网页转文本(只读网络操作, 静态 allow); SSRF 主机名防线 + FetchFn 注入式可替换
+  tools.register(new WebFetchTool({ log: logS }));
   // Task: explore 型只读子代理(独立上下文); 子代理注册表不含 Task → 防无限嵌套
   tools.register(new TaskTool(createExploreAgent({
     provider: opts.provider,

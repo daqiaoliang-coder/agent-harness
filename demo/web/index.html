@@ -297,7 +297,7 @@ function assistantMessage(text) {
 // ── 渲染: 工具卡片 ──
 function inputSummary(name, input) {
   if (name === "Bash" && input.command) return String(input.command);
-  for (const k of ["path", "file_path", "pattern", "query", "prompt"]) {
+  for (const k of ["path", "file_path", "pattern", "query", "prompt", "url"]) {
     if (input[k]) return `${k}: ${input[k]}`;
   }
   return JSON.stringify(input).slice(0, 120);

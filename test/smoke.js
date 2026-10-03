@@ -2414,6 +2414,304 @@ exit 1
     }
   });
 
+  // ---------- Part 18: WebSearch 联网搜索(静态 allow + 注入式后端 + 中止 + 截断) ----------
+  console.log("[18] WebSearch: 静态 allow/参数校验/注入式 searchFn/中止两态/parseDuckHtml 纯函数/16K 截断");
+  const { WebSearchTool, parseDuckHtml } = require("../dist/tools/websearch");
+
+  await test("WebSearch: 静态 allow + inputSchema 声明 + 调度层校验(required/类型)", async () => {
+    const tool = new WebSearchTool();
+    assert.strictEqual(tool.name, "WebSearch");
+    const sc = tool.checkPermissions({ query: "x" });
+    assert.strictEqual(sc.decision, "allow", "只读网络搜索 → 瀑布第②层直接放行");
+    assert.deepStrictEqual(tool.inputSchema.required, ["query"]);
+    assert.strictEqual(tool.inputSchema.properties.query.type, "string");
+    assert.strictEqual(tool.inputSchema.properties.max_results.type, "number");
+    assert.deepStrictEqual(validateToolInput(tool.inputSchema, { max_results: "5" }), [
+      { field: "query", problem: "必填字段缺失" },
+      { field: "max_results", problem: '类型应为 number, 实际 string("5")' },
+    ]);
+  });
+
+  await test("WebSearch: 显式空 query → isError(与调度层'缺失'分工, 对齐 Bash command 先例)", async () => {
+    const tool = new WebSearchTool({ search: async () => [], log: () => {} });
+    const r = await tool.execute({ query: "   " });
+    assert.ok(r.isError, "空白串 = 显式空值, 工具层拒绝");
+    assert.ok(r.content.includes("query 不能为空"));
+  });
+
+  await test("WebSearch: max_results 越界报错不 clamp(0/11/2.5/'5'); 合法值与固定超时传至 searchFn", async () => {
+    const tool = new WebSearchTool({ search: async () => [], log: () => {} });
+    for (const bad of [0, 11, 2.5]) {
+      const r = await tool.execute({ query: "x", max_results: bad });
+      assert.ok(r.isError, `max_results=${bad} 应报错`);
+      assert.ok(r.content.includes("1-10"), r.content);
+    }
+    const seen = [];
+    const tool2 = new WebSearchTool({
+      search: async (q, opts) => {
+        seen.push({ q, maxResults: opts.maxResults, timeoutMs: opts.timeoutMs });
+        return [{ title: "t", url: "https://a/1", snippet: "s" }];
+      },
+      log: () => {},
+    });
+    await tool2.execute({ query: "关键词", max_results: 7 });
+    assert.deepStrictEqual(seen, [{ q: "关键词", maxResults: 7, timeoutMs: 15000 }], "默认 5/显式 7 均透传, 超时固定 15s");
+  });
+
+  await test("WebSearch: 编号渲染(title/url/snippet) + 无摘要条目紧凑 + 统计行 + log 一行", async () => {
+    const logs = [];
+    const tool = new WebSearchTool({
+      search: async () => [
+        { title: "结果甲", url: "https://a.example/1", snippet: "摘要甲" },
+        { title: "结果乙", url: "https://b.example/2", snippet: "" },
+      ],
+      log: (l) => logs.push(l),
+    });
+    const r = await tool.execute({ query: "测试" });
+    assert.ok(!r.isError, JSON.stringify(r));
+    assert.ok(r.content.includes("[1] 结果甲\n    https://a.example/1\n    摘要甲"), r.content);
+    assert.ok(r.content.includes("[2] 结果乙\n    https://b.example/2"), "无 snippet 不产生空摘要行");
+    assert.ok(r.content.includes("(共 2 条结果, 来源: DuckDuckGo)"), "尾部统计行");
+    assert.ok(logs.some((l) => l.includes('[WebSearch] "测试" → 2 条')), logs.join("\n"));
+  });
+
+  await test("WebSearch: 空结果 → '未找到' 非 isError; 后端抛错 → isError 含 query 与错误信息", async () => {
+    const r = await new WebSearchTool({ search: async () => [] }).execute({ query: "无结果词" });
+    assert.ok(!r.isError);
+    assert.ok(r.content.includes("未找到") && r.content.includes("无结果词"));
+    const r2 = await new WebSearchTool({ search: async () => { throw new Error("network down"); } }).execute({ query: "挂了" });
+    assert.ok(r2.isError);
+    assert.ok(r2.content.includes("WebSearch 失败") && r2.content.includes("network down") && r2.content.includes("挂了"));
+  });
+
+  await test("WebSearch: 中止两态 — 预先 aborted 不发起请求; 执行中 abort → '[aborted by user]'", async () => {
+    const ctrl = new AbortController();
+    ctrl.abort();
+    let called = false;
+    const tool = new WebSearchTool({ search: async () => { called = true; return []; }, log: () => {} });
+    const r = await tool.execute({ query: "x" }, { signal: ctrl.signal });
+    assert.strictEqual(r.content, "[aborted by user]");
+    assert.ok(r.isError);
+    assert.strictEqual(called, false, "预先中止 → 不发起请求(Bash 同款)");
+    // 执行中中止: fake 后端在 abort 时 reject
+    const ctrl2 = new AbortController();
+    const tool2 = new WebSearchTool({
+      search: (q, opts) =>
+        new Promise((_, rej) => opts.signal?.addEventListener("abort", () => rej(new Error("aborted")))),
+      log: () => {},
+    });
+    const p = tool2.execute({ query: "y" }, { signal: ctrl2.signal });
+    setTimeout(() => ctrl2.abort(), 10);
+    const r2 = await p;
+    assert.ok(r2.isError);
+    assert.strictEqual(r2.content, "[aborted by user]");
+  });
+
+  await test("parseDuckHtml: result__a 标题/链接 + uddg 重定向解码 + snippet 配对 + 去标签/实体; 非法 url 跳过", async () => {
+    const sampleHtml = [
+      `<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&rut=x">Example <b>Domain</b></a>`,
+      `<a class="result__snippet" href="//s">The <b>Example Domain</b> is &amp; for use in examples.</a>`,
+      `<a rel="nofollow" class="result__a" href="https://direct.org/page">Direct &amp; Link</a>`,
+      `<td class="result__snippet">second snippet &quot;quoted&quot; &lt;tag&gt;</td>`,
+      `<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=javascript%3Avoid(0)">Bad</a>`,
+    ].join("\n");
+    const rs = parseDuckHtml(sampleHtml, 10);
+    assert.strictEqual(rs.length, 2, "非 http 解码结果(javascript:void)跳过");
+    assert.deepStrictEqual(rs[0], {
+      title: "Example Domain",
+      url: "https://example.com/a",
+      snippet: "The Example Domain is & for use in examples.",
+    });
+    assert.deepStrictEqual(rs[1], {
+      title: "Direct & Link",
+      url: "https://direct.org/page",
+      snippet: 'second snippet "quoted" <tag>',
+    });
+    assert.strictEqual(parseDuckHtml(sampleHtml, 1).length, 1, "maxResults 截断");
+  });
+
+  await test("WebSearch: 输出 16K 硬上限 — 截断尾注 + 不追加统计行", async () => {
+    const big = Array.from({ length: 10 }, (_, i) => ({
+      title: `T${i}`,
+      url: `https://x.example/${i}`,
+      snippet: "S".repeat(2000),
+    }));
+    const r = await new WebSearchTool({ search: async () => big, log: () => {} }).execute({ query: "大" });
+    assert.ok(!r.isError);
+    assert.ok(r.content.endsWith("[output truncated at 16K chars]"), r.content.slice(-40));
+    assert.ok(!r.content.includes("来源: DuckDuckGo"), "截断时不追加统计行");
+    assert.strictEqual(r.content.length, 16000 + 1 + "[output truncated at 16K chars]".length);
+  });
+
+  // ---------- Part 18: WebFetch + Edit 多编辑(P2a 工具面) ----------
+  console.log("[18] WebFetch + Edit 多编辑");
+  const { WebFetchTool, validateUrl, isPrivateHost, htmlToText } = require("../dist/tools/webfetch");
+  const { applyEdits } = require("../dist/tools/edit");
+  const wf = new WebFetchTool({ fetch: async () => ({ status: 200, contentType: "text/html", text: "<p>x</p>", finalUrl: "https://ok.example/" }), log: () => {} });
+
+  await test("validateUrl: 无效/非 http 协议/内网与元数据主机全拒; 公网通过", async () => {
+    assert.ok(validateUrl("not a url").includes("无效 URL"));
+    assert.ok(validateUrl("file:///etc/passwd").includes("仅支持 http/https"));
+    assert.ok(validateUrl("ftp://x.example/f").includes("仅支持 http/https"));
+    for (const h of ["localhost", "a.localhost", "127.0.0.1", "0.0.0.0", "10.1.2.3", "192.168.1.1",
+      "172.16.0.1", "172.31.255.255", "169.254.169.254", "[::1]", "metadata.google.internal"]) {
+      assert.ok(validateUrl(`http://${h}/x`).includes("SSRF"), `${h} 应被拒`);
+    }
+    assert.strictEqual(validateUrl("https://example.com/a?b=1"), null);
+    assert.strictEqual(validateUrl("http://8.8.8.8/dns"), null);
+    // 边界: 172.15/172.32 不在私网 B 段
+    assert.strictEqual(isPrivateHost("172.15.0.1"), false);
+    assert.strictEqual(isPrivateHost("172.32.0.1"), false);
+  });
+
+  await test("htmlToText: script/style/注释剔除 + 块级断行 + 实体解码 + 空白折叠", async () => {
+    const html = [
+      "<html><head><title>T</title><style>body{color:red}</style></head>",
+      "<body><!-- comment --><script>alert(1)</script>",
+      "<h1>Hello &amp; World</h1><p>line&nbsp;one<br>line two</p>",
+      "<div>a</div><div>b</div>",
+      "</body></html>",
+    ].join("");
+    const t = htmlToText(html);
+    assert.ok(!t.includes("color:red") && !t.includes("alert") && !t.includes("comment"), t);
+    assert.ok(t.includes("Hello & World"), t);
+    assert.ok(t.includes("line one\nline two"), t);
+    assert.ok(t.includes("a\nb"), t);
+  });
+
+  await test("WebFetch: HTML → 转文本标记; JSON 原样; 404 → isError 含状态与正文预览", async () => {
+    const r1 = await new WebFetchTool({
+      fetch: async () => ({ status: 200, contentType: "text/html; charset=utf-8", text: "<h1>标题</h1><p>正文</p>", finalUrl: "https://a.example/x" }),
+      log: () => {},
+    }).execute({ url: "https://a.example/x" });
+    assert.ok(!r1.isError);
+    assert.ok(r1.content.includes("[html→text]"), r1.content.slice(0, 60));
+    assert.ok(r1.content.includes("标题") && r1.content.includes("正文"));
+
+    const r2 = await new WebFetchTool({
+      fetch: async () => ({ status: 200, contentType: "application/json", text: '{"k":1}', finalUrl: "https://a.example/j" }),
+      log: () => {},
+    }).execute({ url: "https://a.example/j" });
+    assert.ok(!r2.isError && r2.content.includes('{"k":1}') && !r2.content.includes("[html→text]"));
+
+    const r3 = await new WebFetchTool({
+      fetch: async () => ({ status: 404, contentType: "text/html", text: "Not Found Page", finalUrl: "https://a.example/none" }),
+      log: () => {},
+    }).execute({ url: "https://a.example/none" });
+    assert.ok(r3.isError && r3.content.includes("HTTP 404") && r3.content.includes("Not Found Pa"));
+  });
+
+  await test("WebFetch: 重定向落内网 → 二次校验拒绝; 截断尾注; max_chars/url 空串报错; 静态 allow", async () => {
+    const r1 = await new WebFetchTool({
+      fetch: async () => ({ status: 200, contentType: "text/plain", text: "secret", finalUrl: "http://169.254.169.254/latest/meta-data/" }),
+      log: () => {},
+    }).execute({ url: "https://jump.example/redirect" });
+    assert.ok(r1.isError && r1.content.includes("重定向最终地址") && r1.content.includes("169.254.169.254"), r1.content);
+
+    const r2 = await new WebFetchTool({
+      fetch: async () => ({ status: 200, contentType: "text/plain", text: "A".repeat(5000), finalUrl: "https://b.example/big" }),
+      log: () => {},
+    }).execute({ url: "https://b.example/big", max_chars: 2000 });
+    assert.ok(!r2.isError);
+    assert.ok(r2.content.endsWith("[output truncated at 2000 chars]"), r2.content.slice(-40));
+
+    const r3 = await wf.execute({ url: "   " });
+    assert.ok(r3.isError && r3.content.includes("url 不能为空"));
+    const r4 = await wf.execute({ url: "https://ok.example/", max_chars: 999 });
+    assert.ok(r4.isError && r4.content.includes("max_chars 须为"), r4.content);
+    const perm = wf.checkPermissions({ url: "https://ok.example/" });
+    assert.strictEqual(perm.decision, "allow");
+  });
+
+  await test("WebFetch: 中止两态 — 预先 aborted 不发请求; 执行中 abort → '[aborted by user]'", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const r1 = await wf.execute({ url: "https://ok.example/x" }, { signal: ac.signal });
+    assert.ok(r1.isError && r1.content === "[aborted by user]");
+    const r2 = await new WebFetchTool({
+      fetch: (_u, o) => new Promise((_res, rej) => { o.signal?.addEventListener("abort", () => rej(new Error("aborted")), { once: true }); }),
+      log: () => {},
+    }).execute({ url: "https://ok.example/x" }, { signal: ac.signal });
+    assert.ok(r2.isError && r2.content === "[aborted by user]");
+  });
+
+  await test("applyEdits: 按序应用(前条产物=后条输入) + counts 计数", async () => {
+    const r = applyEdits("a b c\n", [
+      { old_string: "a", new_string: "A", replace_all: false },
+      { old_string: "A b", new_string: "X", replace_all: false },
+      { old_string: "c", new_string: "c c", replace_all: false },
+    ]);
+    assert.ok(r.ok);
+    assert.strictEqual(r.content, "X c c\n");
+    assert.deepStrictEqual(r.counts, [1, 1, 1]);
+  });
+
+  await test("Edit 多编辑: 原子落盘 — 第 2 条未命中 → 文件不变, 报错带序号与提示", async () => {
+    const fM = path.join(dir, "multi.txt");
+    fs.writeFileSync(fM, "alpha beta\ngamma delta\n", "utf8");
+    await read.execute({ path: fM });
+    const before = fs.readFileSync(fM, "utf8");
+    const r = await edit.execute({ path: fM, edits: [
+      { old_string: "alpha", new_string: "ALPHA" },
+      { old_string: "不存在的串", new_string: "x" },
+    ] });
+    assert.ok(r.isError, r.content);
+    assert.ok(r.content.includes("edits[1]") && r.content.includes("此前 1 条已匹配") && r.content.includes("原子性保证整体未落盘"), r.content);
+    assert.strictEqual(fs.readFileSync(fM, "utf8"), before, "原子性: 任一条失败整体不落盘");
+  });
+
+  await test("Edit 多编辑: 全部命中 → 按序落盘 + 逐条计数; replace_all 可按条覆写", async () => {
+    const fM = path.join(dir, "multi2.txt");
+    fs.writeFileSync(fM, "one two\none two\nthree\n", "utf8");
+    await read.execute({ path: fM });
+    const r = await edit.execute({ path: fM, edits: [
+      { old_string: "two", new_string: "2", replace_all: true },   // 命中 2 处
+      { old_string: "one 2\none 2", new_string: "UNO", replace_all: false }, // 依赖前条产物(演进内容唯一)
+      { old_string: "three", new_string: "3", replace_all: false },
+    ] });
+    assert.ok(!r.isError, r.content);
+    assert.ok(r.content.includes("3 条编辑共替换 4 处") && r.content.includes("#0×2"), r.content);
+    assert.strictEqual(fs.readFileSync(fM, "utf8"), "UNO\n3\n");
+  });
+
+  await test("Edit 多编辑: 参数防线 — 混用/空数组/坏条目/ambiguous 带序号", async () => {
+    const fM = path.join(dir, "multi3.txt");
+    fs.writeFileSync(fM, "x x y\n", "utf8");
+    await read.execute({ path: fM });
+    assert.ok((await edit.execute({ path: fM, edits: [{ old_string: "x", new_string: "z" }], old_string: "x", new_string: "z" })).isError, "混用应报错");
+    assert.ok((await edit.execute({ path: fM, edits: [] })).isError, "空数组应报错");
+    const bad = await edit.execute({ path: fM, edits: [{ old_string: "x", new_string: "z" }, { old_string: "y" }] });
+    assert.ok(bad.isError && bad.content.includes("edits[1]"), bad.content);
+    const amb = await edit.execute({ path: fM, edits: [{ old_string: "x", new_string: "z" }] });
+    assert.ok(amb.isError && amb.content.includes("edits[0]") && amb.content.includes("出现 2 次"), amb.content);
+    // 显式空串 = 删除语义(多编辑模式同样成立)
+    const del = await edit.execute({ path: fM, edits: [{ old_string: "y", new_string: "" }] });
+    assert.ok(!del.isError && fs.readFileSync(fM, "utf8") === "x x \n", fs.readFileSync(fM, "utf8"));
+  });
+
+  await test("buildPermissionPreview: 多编辑预览 — 原子说明 + 失败条提示 + 不污染 fileState", async () => {
+    const dirP18 = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-preview18-"));
+    const fP = path.join(dirP18, "p.txt");
+    fs.writeFileSync(fP, "l1\nl2\nl3\n", "utf8");
+    const pv = buildPermissionPreview("Edit", { path: fP, edits: [
+      { old_string: "l1", new_string: "L1" },
+      { old_string: "l2", new_string: "L2" },
+    ] }, dirP18);
+    assert.ok(pv.note && pv.note.includes("多编辑: 2 条按序应用"), pv.note);
+    assert.strictEqual(pv.lines.filter((l) => l.op === "add").length, 2);
+    // 失败条: 第二条未命中 → note 提示将失败(原子), 但第一条 hunk 仍渲染
+    const pv2 = buildPermissionPreview("Edit", { path: fP, edits: [
+      { old_string: "l3", new_string: "L3" },
+      { old_string: "zzz", new_string: "x" },
+    ] }, dirP18);
+    assert.ok(pv2.note.includes("edits[1]") && pv2.note.includes("执行将失败"), pv2.note);
+    // 不污染 fileState: 预览后 Edit 仍被先读后改拦截
+    const e2 = new EditTool();
+    const blocked = await e2.execute({ path: fP, edits: [{ old_string: "l1", new_string: "L1" }] });
+    assert.ok(blocked.isError && blocked.content.includes("File has not been read yet"), blocked.content);
+    fs.rmSync(dirP18, { recursive: true, force: true });
+  });
+
   fs.rmSync(headlessHome, { recursive: true, force: true });
 
   fs.rmSync(dirS, { recursive: true, force: true });
